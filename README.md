@@ -7,9 +7,9 @@
 ## ディレクトリ構成
 - notebook
   - config.yaml
-  - extruct_race_data.ipynv
-  - predict_jra_racing.ipynv
-  - optimize_bet.ipynv
+  - extruct_race_data.ipynb
+  - predict_jra_racing.ipynb
+  - optimize_bet.ipynb
 - src
   - (TBD)
 
