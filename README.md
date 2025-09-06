@@ -6,13 +6,15 @@
 
 ## ディレクトリ構成
 - notebook
+  - config.yaml
+  - extruct_race_data.ipynv
   - predict_jra_racing.ipynv
   - optimize_bet.ipynv
 - src
   - (TBD)
 
-## 環境変数の設定
-- なしで動くように開発（予定）
+## 環境変数
+- PATH_STRAGE_RACE_DATA：競馬データの保存先パス
 
 ## 注意事項
 - 本プロダクトは、馬券の当選を保証するものではありません。
