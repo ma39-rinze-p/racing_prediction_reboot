@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from racing_prediction.betting.optimize_bet import best_wide_boxes, wide_expected_values
+from racing_prediction.betting.optimize_bet import wide_expected_values
 from racing_prediction.config import BettingConfig, load_betting_config
 from racing_prediction.data.make_dataset import build_race_table
 from racing_prediction.data.race_list import fetch_race_schedule, venue_code
@@ -124,16 +124,33 @@ def due_races(
 # ---------------------------------------------------------------------------
 # 予測と通知
 # ---------------------------------------------------------------------------
+def complete_race_info(race_info: dict, table: pd.DataFrame) -> dict:
+    """レース名・コース・発走時刻がない場合 (手動で別の日のレース ID を指定したときなど) は,
+    出馬表の開催日の時刻表を取得して補う. 取れなければそのまま返す.
+    """
+    if race_info.get("race_name") and race_info.get("course"):
+        return race_info
+    try:
+        schedule = fetch_race_schedule(pd.Timestamp(table["race_date"].iloc[0]))
+        match = schedule[schedule["race_id"] == race_info["race_id"]]
+        if not match.empty:
+            return {**race_info, **match.iloc[0].to_dict()}
+    except Exception as e:  # noqa: BLE001 - レース情報が補えなくても予測は通知する
+        print(f"{race_info['race_id']}: レース情報を補えませんでした: {e}")
+    return race_info
+
+
 def predict_race(race_info: dict, booster, builder, betting: BettingConfig | None = None) -> tuple[str, str]:
-    """1 レースを取得・予測し, その時点のワイドのオッズから期待値とおすすめボックスを計算して,
+    """1 レースを取得・予測し, その時点のワイドのオッズから組み合わせごとの期待値を計算して,
     通知の (件名, 本文) を返す. オッズが取れなくても, 予測だけで通知する.
     """
     table = build_race_table(race_info["race_id"])
+    race_info = complete_race_info(race_info, table)
     pred = predict_top3(table, booster, builder).reset_index(drop=True)
     in_top = simulate_top3(pred)
     wide = wide_probabilities(pred, in_top=in_top)
 
-    wide_ev = boxes = None
+    wide_ev = None
     try:
         odds = fetch_wide_odds(race_info["race_id"])
         status = {"middle": "発売中", "result": "確定"}.get(odds.status, odds.status or "状態不明")
@@ -142,11 +159,10 @@ def predict_race(race_info: dict, booster, builder, betting: BettingConfig | Non
             odds_note = f"ワイドのオッズがまだありません ({status})"
         else:
             wide_ev = wide_expected_values(wide, odds.odds, betting)
-            boxes = best_wide_boxes(pred, in_top, wide_ev, betting)
     except Exception as e:  # noqa: BLE001 - オッズが取れなくても予測は通知する
         odds_note = f"取得エラー: {type(e).__name__}"
         print(f"{race_info['race_id']}: ワイドのオッズを取得できませんでした: {e}")
-    return format_race_report(race_info, pred, wide, wide_ev=wide_ev, boxes=boxes, odds_note=odds_note)
+    return format_race_report(race_info, pred, wide, wide_ev=wide_ev, odds_note=odds_note)
 
 
 def main(argv: list[str] | None = None) -> int:
