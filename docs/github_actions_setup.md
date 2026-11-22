@@ -135,7 +135,7 @@ Kaggle はデータセットを更新した直後だと, **前の版** のデー
 定期実行 (schedule) は **デフォルトブランチ (main) にあるワークフローだけ** が動く.
 
 ```
-git add .github src requirements-inference.txt scripts models/production .gitignore docs
+git add .github src requirements-inference.txt scripts models .gitignore .gitattributes configs docs
 git commit -m "Add race inference on GitHub Actions"
 git push
 ```
@@ -251,11 +251,50 @@ GitHub のリポジトリ画面 → **Settings → Secrets and variables → Act
 
 ---
 
+## モデルのバージョン管理
+
+推論で使うモデルはバージョン管理しており, 精度が下がったときに以前のモデルに戻せる (`scripts/model_registry.py`).
+
+```
+models/registry/
+├── registry.json        各バージョンの学習期間・テストの精度と, 適用の履歴
+├── v001/ v002/ ...      各バージョンのモデル
+models/production/       今適用しているバージョンのコピー (GitHub Actions の推論はここを読む)
+└── VERSION.txt          今適用しているバージョン番号
+```
+
+- **既定 (自動モード) では, 登録済みの全バージョンのうちテストの ROC-AUC が最良のモデルが GitHub Actions の推論に使われる.**
+  `train_on_kaggle.py` で学習すると, 新しいモデルは新しいバージョンとして自動で登録され, そのたびに
+  ROC-AUC が最良のバージョンを選び直して `models/production/` に適用する (新しいモデルの方が低ければ, 今のモデルのまま).
+- `promote` / `rollback` で手動で選んだ場合は **手動モード** になり, そのモデルに固定される
+  (新しいモデルを取り込んでも切り替わらない). `best` で自動モードに戻る.
+- 通知メールの末尾に, 使ったモデルのバージョン・学習期間・テストの ROC-AUC が表示される.
+  例: `※ モデル: v001 (学習期間 2025-11-23〜2026-11-22 / テストのROC-AUC 0.750 (レース内 0.731))`
+- `train_on_kaggle.py` のオプション: `--force-promote` (ROC-AUC に関係なく新しいモデルを適用. 手動モード) / `--no-promote` (登録だけ)
+
+| コマンド | 内容 |
+|---|---|
+| `python scripts/model_registry.py list` | バージョンの一覧 (`*` が適用中, `★` が ROC-AUC 最良), 適用モード, 適用の履歴 |
+| `python scripts/model_registry.py best` | 自動モードに戻し, ROC-AUC が最良のバージョンを適用する |
+| `python scripts/model_registry.py rollback` | 1 つ前に適用していたモデルに戻す (続けて実行すると, さらに前へ戻る. 手動モード) |
+| `python scripts/model_registry.py promote v002` | 指定したバージョンを適用する (手動モード) |
+| `python scripts/model_registry.py register <フォルダ>` | 手動でダウンロードしたモデルを登録する |
+
+適用 (`promote` / `rollback`) したら, GitHub Actions に反映するため `models` を commit して main に push する.
+
+**注意**: 自動の選択は, 各モデルの学習時のテスト期間の ROC-AUC どうしを比べている. 学習期間が違うとテスト期間も違うため,
+厳密な比較ではない (テスト期間の短いモデルは数値がぶれやすい). 一覧の「テスト期間」も見て判断すること.
+
+---
+
 ## 運用
 
 | やりたいこと | 方法 |
 |---|---|
-| モデルを作り直す | データを抽出 → `python scripts/train_on_kaggle.py --update-dataset` → `models/production` を commit して main に push |
+| モデルを作り直す | データを抽出 → `python scripts/train_on_kaggle.py --update-dataset` → `models` を commit して main に push |
+| 精度が下がったので前のモデルに戻す | `python scripts/model_registry.py rollback` → `models` を commit して main に push |
+| ROC-AUC が最良のモデルを使う (自動モードに戻す) | `python scripts/model_registry.py best` → `models` を commit して main に push |
+| モデルの一覧・精度を見る | `python scripts/model_registry.py list` |
 | 特定のレースを手動で予測 | `race-inference` を Enable → Run workflow で `race_id` を指定 |
 | 一時的に止める | Actions 画面で `race-day-planner` と `race-inference` を **Disable workflow** |
 | 通知が来ないとき | Actions タブで `race-day-planner` / `race-inference` のログを確認 (失敗した実行は GitHub からメールでも通知される) |

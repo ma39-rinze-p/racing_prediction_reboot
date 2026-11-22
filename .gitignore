@@ -212,8 +212,9 @@ data/**/*
 !data/**/.gitkeep
 models/*
 !models/.gitkeep
-# 推論 (GitHub Actions) で使うモデルはリポジトリで管理する
+# 推論 (GitHub Actions) で使うモデルと, そのバージョン管理 (scripts/model_registry.py) はリポジトリで管理する
 !models/production/
+!models/registry/
 
 # 推論の状態ファイル (GitHub Actions のキャッシュで引き継ぐ)
 .inference_state/

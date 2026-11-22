@@ -204,8 +204,30 @@ def predict_race(race_info: dict, booster, builder) -> tuple[dict, pd.DataFrame]
     return race_info, pred
 
 
+def model_version_label(model_dir: str | Path) -> str:
+    """モデルのバージョン (models/production/VERSION.txt. scripts/model_registry.py が書く), 学習期間,
+    テストの ROC-AUC (全レース / レース内) を 1 行にまとめる."""
+    model_dir = Path(model_dir)
+    version_file = model_dir / "VERSION.txt"
+    version = version_file.read_text(encoding="utf-8").strip() if version_file.exists() else "バージョン不明"
+    try:
+        meta = json.loads((model_dir / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return version
+    details = []
+    if meta.get("train_period"):
+        details.append(f"学習期間 {'〜'.join(meta['train_period'])}")
+    test = meta.get("metrics", {}).get("test", {})
+    if test.get("roc_auc") is not None:
+        auc = f"テストのROC-AUC {test['roc_auc']:.3f}"
+        if test.get("roc_auc_by_race") is not None:
+            auc += f" (レース内 {test['roc_auc_by_race']:.3f})"
+        details.append(auc)
+    return f"{version} ({' / '.join(details)})" if details else version
+
+
 def build_report(
-    race_info: dict, pred: pd.DataFrame, betting: BettingConfig, label: str | None = None
+    race_info: dict, pred: pd.DataFrame, betting: BettingConfig, label: str | None = None, model_version: str | None = None
 ) -> tuple[str, str]:
     """予測結果と, 今のワイドのオッズから全ボックスの期待値を計算し, 通知の (件名, 本文) を返す.
 
@@ -232,7 +254,7 @@ def build_report(
         print(f"{race_info['race_id']}: ワイドのオッズを取得できませんでした: {e}")
     return format_race_report(
         race_info, pred, wide, boxes=boxes, n_boxes_total=n_boxes_total,
-        max_display=betting.box_max_display, odds_note=odds_note, label=label,
+        max_display=betting.box_max_display, odds_note=odds_note, label=label, model_version=model_version,
     )
 
 
@@ -303,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     def get_model():
         if not model:
             booster, builder, metadata = load_artifacts(args.model_dir)
-            print(f"モデル: 学習期間 {metadata['train_period']}")
+            print(f"モデル: {model_version_label(args.model_dir)}")
             model.update(booster=booster, builder=builder)
         return model["booster"], model["builder"]
 
@@ -329,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             "race_name": "", "course": "", "start_time": now,
         }
         info, pred = ensure_prediction(race_info)
-        send(*build_report(info, pred, betting, label="手動実行"), args.dry_run)
+        send(*build_report(info, pred, betting, label="手動実行", model_version=model_version_label(args.model_dir)), args.dry_run)
         return 0
 
     failed = []
@@ -370,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             info, pred = ensure_prediction(race)
-            send(*build_report(info, pred, betting, label=f"発走{m}分前"), args.dry_run)
+            send(*build_report(info, pred, betting, label=f"発走{m}分前", model_version=model_version_label(args.model_dir)), args.dry_run)
             if not args.dry_run:
                 state["sent"].setdefault(race_id, []).append(m)
                 save_state(state_path, state)

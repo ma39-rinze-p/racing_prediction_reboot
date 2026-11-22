@@ -74,6 +74,7 @@ def format_race_report(
     max_display: int = 20,
     odds_note: str | None = None,
     label: str | None = None,
+    model_version: str | None = None,
 ) -> tuple[str, str]:
     """1 レース分の (件名, 本文) を作る.
 
@@ -137,6 +138,7 @@ def format_race_report(
         "  オッズから逆算した市場の確率を組み合わせたもの (オッズ50倍超・モデル確率5%未満の組は市場の確率のみ.",
         "  configs/betting.yaml). 的中率はボックス内の2頭以上が3着以内に入る確率 (モデル).",
         "※ 予測は参考情報であり, 馬券の的中・利益を保証するものではありません.",
+        *( [f"※ モデル: {model_version}"] if model_version else [] ),
     ]
     course_short = surface if distance == "不明" else f"{surface}{distance}"
     ev_label = "" if n_positive is None else (f" 期待値+ボックス{n_positive:,}通り" if n_positive else " 期待値+なし")

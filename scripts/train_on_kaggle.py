@@ -7,7 +7,9 @@
     3. kaggle kernels push でノートブックを Kaggle に送り, 最初から最後まで実行する (= Save & Run All)
     4. kaggle kernels status で実行が終わるまで待つ
     5. kaggle kernels output で出力一式をダウンロードして reports/kaggle_runs/<日時>/ に保存し,
-       モデルを models/production/ に取り込む (失敗した場合もログを reports/kaggle_runs/<日時>_error/ に保存する)
+       モデルを新しいバージョンとして models/registry/ に登録する. 自動モード (既定) なら, 登録済みの全バージョンの
+       うちテストの ROC-AUC が最良のものを models/production/ に適用する (scripts/model_registry.py).
+       (失敗した場合もログを reports/kaggle_runs/<日時>_error/ に保存する)
 
 使い方 (リポジトリのルートで実行):
     python scripts/train_on_kaggle.py --update-dataset   # データ・コード・設定を更新してから学習 (通常はこれ)
@@ -115,13 +117,41 @@ def update_dataset(user: str, slug: str, dry_run: bool) -> str:
 
     exists = kaggle("datasets", "status", f"{user}/{slug}", check=False).returncode == 0
     if exists:
-        kaggle("datasets", "version", "-p", str(DATASET_DIR), "--dir-mode", "zip", "-m",
-               f"update ({n_csv} csv, {fingerprint})", dry_run=dry_run)
+        args = ("datasets", "version", "-p", str(DATASET_DIR), "--dir-mode", "zip", "-m", f"update ({n_csv} csv, {fingerprint})")
     else:
-        kaggle("datasets", "create", "-p", str(DATASET_DIR), "--dir-mode", "zip", dry_run=dry_run)
-    if not dry_run:
-        wait_dataset_version(user, slug, fingerprint)
+        args = ("datasets", "create", "-p", str(DATASET_DIR), "--dir-mode", "zip")
+    if dry_run:
+        kaggle(*args, dry_run=True)
+        return fingerprint
+
+    upload_with_retry(args, user, slug, fingerprint)
+    wait_dataset_version(user, slug, fingerprint)
     return fingerprint
+
+
+def upload_with_retry(args: tuple[str, ...], user: str, slug: str, fingerprint: str, waits: tuple[int, ...] = (60, 180)) -> None:
+    """アップロード (kaggle datasets version / create) を, 失敗したら少し待ってやり直す.
+
+    Kaggle は直前の版の処理中に続けて版を作ろうとすると "400 Bad Request" を返すことがある
+    (短時間に何度もアップロードした場合など). 一時的な失敗なので, 待ってからやり直す.
+    やり直す前に, 失敗したように見えて実は版が作られていないかを識別値で確認し, 作られていればやり直さない.
+    """
+    for attempt in range(len(waits) + 1):
+        if kaggle(*args, check=False).returncode == 0:
+            return
+        if attempt == len(waits):
+            break
+        print(f"アップロードに失敗しました. {waits[attempt]} 秒待ってから確認します "
+              f"(Kaggle が直前の版を処理中の場合などに, 一時的に失敗することがあります)", flush=True)
+        time.sleep(waits[attempt])
+        if remote_fingerprint(user, slug) == fingerprint:
+            print("Kaggle 上には今回の版が作られていたため, やり直しません")
+            return
+        print(f"やり直します ({attempt + 2} 回目)")
+    raise SystemExit(
+        "アップロードに失敗しました (何度か待ってやり直しても失敗). 数分おいてから再実行するか, "
+        f"https://www.kaggle.com/datasets/{user}/{slug} で状況を確認してください."
+    )
 
 
 def wait_dataset_version(user: str, slug: str, fingerprint: str, interval: int = 20, timeout_min: int = 30) -> None:
@@ -277,7 +307,11 @@ def main() -> None:
     parser.add_argument("--internet", action="store_true", help="Kaggle での実行時にインターネットを有効にする (通常は不要)")
     parser.add_argument("--poll-interval", type=int, default=60, help="実行状況を確認する間隔 (秒)")
     parser.add_argument("--timeout-hours", type=float, default=12, help="実行の完了を待つ最大時間 (Kaggle の上限は 12 時間)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--force-promote", action="store_true", help="ROC-AUC に関係なく新しいモデルを適用する (手動モードになる)")
+    mode.add_argument("--no-promote", action="store_true", help="新しいモデルを登録だけして適用しない")
     args = parser.parse_args()
+    promote_mode = "force" if args.force_promote else "none" if args.no_promote else "auto"
 
     user = resolve_kaggle_user(args.kaggle_user)
     kernel = f"{user}/{args.kernel_slug}"
@@ -310,8 +344,8 @@ def main() -> None:
         print("\n== 4. 実行の完了を待つ")
         wait_kernel_complete(kernel, args.poll_interval, args.timeout_hours)
 
-    print("\n== 5. 実行結果をローカルに保存し, モデルを models/production に取り込む")
-    run_dir = fetch_from_kernel(kernel)
+    print("\n== 5. 実行結果をローカルに保存し, モデルを新しいバージョンとして登録する")
+    run_dir = fetch_from_kernel(kernel, promote_mode=promote_mode)
     print_summary()
     if (run_dir / "results" / "summary.json").exists():
         print(f"評価結果: {run_dir / 'results'} (summary.json, test_predictions.csv, グラフなど)")
