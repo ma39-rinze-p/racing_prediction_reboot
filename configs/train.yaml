@@ -1,0 +1,21 @@
+# 学習 (notebooks/predict_jra_racing.ipynb) の設定.
+# Kaggle で学習する場合, この内容はデータセットと一緒にアップロードされる.
+# 変更したら `python scripts/train_on_kaggle.py --update-dataset` で反映すること.
+
+data:
+  # 学習・テストに使うデータの期間 (開催日, 両端を含む). null なら制限なし
+  start_date: "2025-11-23"
+  end_date: "2026-10-17"
+
+split:
+  # 全開催日数のうち, 直近の何割の開催日をテストにするか (0 より大きく 1 より小さい)
+  # カレンダーの期間ではなく開催日の数で分けるので, 開催がない月があってもテストの量が安定する
+  test_ratio: 0.2
+
+tuning:
+  # Optuna の試行回数
+  n_trials: 100
+  # Optuna の打ち切り時間 (秒). null なら試行回数だけで止める
+  timeout_sec: 3600
+  # 学習期間内の時系列 CV の fold 数 (データが少ないとエラーになるので, その場合は小さくする)
+  n_folds: 3

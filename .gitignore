@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project: data & model artifacts (keep directory structure only)
+data/**/*
+!data/**/
+!data/**/.gitkeep
+models/*
+!models/.gitkeep
+# 推論 (GitHub Actions) で使うモデルはリポジトリで管理する
+!models/production/
+
+# 推論の状態ファイル (GitHub Actions のキャッシュで引き継ぐ)
+.inference_state/
+
+# グラフ用の日本語フォント (約 10MB. scripts/download_japanese_font.py でダウンロードする)
+assets/fonts/
+
+# 学習の評価結果 (ローカル実行: reports/latest, Kaggle の実行結果: reports/kaggle_runs)
+reports/latest/
+reports/kaggle_runs/
+reports/figures/*
+!reports/figures/.gitkeep
