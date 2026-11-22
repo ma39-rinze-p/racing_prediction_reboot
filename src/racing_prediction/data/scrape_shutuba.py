@@ -141,21 +141,32 @@ def parse_shutuba_html(html: str) -> pd.DataFrame:
 
 
 _SURFACE_MAP = {"芝": "turf", "ダ": "dirt", "障": "steeple"}
+# 馬場状態 (過去戦績の track_condition と同じ表記に揃える)
+_TRACK_CONDITION_MAP = {"良": "good", "稍": "yielding", "重": "soft", "不": "heavy"}
 
 
 def _parse_race_info(soup: BeautifulSoup) -> dict:
     """レース名の下の情報欄から 競馬場・芝/ダート・距離 を取り出す.
 
     RaceData01: "13:10発走 / ダ2100m 左 / 晴 / 良 ..."
+        馬場状態は 芝なら span.Item03, ダートなら span.Item04 (当日の発表前は存在しない)
     RaceData02: "5回 東京 5日目 ..." (2 番目の span が競馬場)
     """
     data01 = _text(soup.select_one("div.RaceData01"))
     m = re.search(r"(芝|ダ|障)(\d+)m", data01)
     spans = soup.select("div.RaceData02 span")
+    surface = _SURFACE_MAP[m.group(1)] if m else None
+    item = {"turf": "Item03", "dirt": "Item04"}.get(surface)
+    condition_span = soup.select_one(f"div.RaceData01 span.{item}") if item else None
+    if condition_span is None:  # 障害レースなどはどちらか載っている方を使う
+        condition_span = soup.select_one("div.RaceData01 span.Item03, div.RaceData01 span.Item04")
+    condition = _text(condition_span)
     return {
         "race_venue": _text(spans[1]) if len(spans) > 1 else None,
-        "race_surface": _SURFACE_MAP[m.group(1)] if m else None,
+        "race_surface": surface,
         "race_distance": int(m.group(2)) if m else None,
+        # 当日の馬場状態: "good"(良) / "yielding"(稍重) / "soft"(重) / "heavy"(不良) / None(発表前)
+        "race_track_condition": _TRACK_CONDITION_MAP.get(condition[:1]),
     }
 
 
@@ -166,11 +177,12 @@ def _parse_race_date(soup: BeautifulSoup) -> pd.Timestamp | None:
 
 
 def parse_result_html(html: str) -> pd.DataFrame:
-    """レース結果ページの HTML から 馬番・着順・馬体重 を取り出す.
+    """レース結果ページの HTML から 馬番・着順・馬体重・単勝オッズ・人気 を取り出す.
 
+    単勝オッズ (win_odds) と人気 (popularity) は確定 (最終) オッズ.
     結果が未確定 (結果テーブルが無い) の場合は空の DataFrame を返す.
     """
-    columns = ["umaban", "rank", "rank_text", "horse_weight", "weight_diff"]
+    columns = ["umaban", "rank", "rank_text", "horse_weight", "weight_diff", "win_odds", "popularity"]
     soup = BeautifulSoup(html, "html.parser")
     table = soup.select_one("div.ResultTableWrap table")
     if table is None:
@@ -183,6 +195,7 @@ def parse_result_html(html: str) -> pd.DataFrame:
         tds = tr.find_all("td", recursive=False)
         umaban = _text(tds[2]) if len(tds) > 2 else ""  # 着順, 枠, 馬番 の順
         horse_weight, weight_diff = _parse_weight(_text(tr.find("td", class_="Weight")))
+        popularity = _text(tr.select_one("span.OddsPeople"))
         rows.append(
             {
                 "umaban": int(umaban) if umaban.isdigit() else None,
@@ -190,6 +203,9 @@ def parse_result_html(html: str) -> pd.DataFrame:
                 "rank_text": rank_text,
                 "horse_weight": horse_weight,
                 "weight_diff": weight_diff,
+                # 単勝オッズのセルは td.Odds.Txt_R (1 番人気だけ span に Odds_Ninki クラスが付く)
+                "win_odds": _to_float(_text(tr.select_one("td.Odds.Txt_R"))),
+                "popularity": int(popularity) if popularity.isdigit() else None,
             }
         )
     return pd.DataFrame(rows, columns=columns)
@@ -217,7 +233,7 @@ def fetch_shutuba(race_id: str, with_result: bool = True) -> pd.DataFrame:
         for col in ("horse_weight", "weight_diff"):
             df[col] = df[col].combine_first(df.pop(f"{col}_result"))
 
-    for col in ("horse_weight", "weight_diff", "rank"):
+    for col in ("horse_weight", "weight_diff", "rank", "popularity"):
         if col in df:
             df[col] = df[col].astype("Int64")
     return df

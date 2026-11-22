@@ -14,6 +14,8 @@ netkeiba から取得した出馬表・結果・過去戦績・血統をもと�
     特徴量   : レースの場所・距離区分・芝/ダート, 馬ごとの情報, 条件別平均着順, 血統 (ID なし)
     目的変数 : is_top3 (3 着以内なら 1, それ以外は 0. 結果未確定のレースは欠損)
     参考     : rank (着順)
+    馬券用   : win_odds (確定単勝オッズ), popularity (人気)
+               レース後に確定する値なので特徴量には使わない (リーク). 馬券購入の最適化に使う
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from racing_prediction.features.build_features import (
 
 ID_COLUMNS = ["race_id", "race_date", "umaban"]
 
-RACE_FEATURE_COLUMNS = ["race_venue", "race_distance_category", "race_surface"]
+RACE_FEATURE_COLUMNS = ["race_venue", "race_distance_category", "race_surface", "race_track_condition"]
 
 HORSE_FEATURE_COLUMNS = [
     "horse_name",
@@ -51,6 +53,9 @@ HORSE_FEATURE_COLUMNS = [
 PEDIGREE_FEATURE_COLUMNS = ["sire", "sire_line", "dam", "sire_sire", "sire_dam", "dam_sire", "dam_dam"]
 
 TARGET_COLUMN = "is_top3"
+
+# 特徴量には入れない列 (着順と, 馬券購入の最適化に使う確定オッズ・人気)
+RESULT_COLUMNS = ["rank", "win_odds", "popularity"]
 
 # 出走しなかった馬 (着順欄がこれらの場合はテーブルから除く)
 NOT_STARTED = ("取消", "除外")
@@ -83,7 +88,12 @@ def build_race_table(race_id: str) -> pd.DataFrame:
     else:
         df[TARGET_COLUMN] = pd.array([pd.NA] * len(df), dtype="Int64")
 
-    return df[ID_COLUMNS + feature_columns() + [TARGET_COLUMN, "rank"]].reset_index(drop=True)
+    return df[output_columns()].reset_index(drop=True)
+
+
+def output_columns() -> list[str]:
+    """CSV に保存する列の順番."""
+    return ID_COLUMNS + feature_columns() + [TARGET_COLUMN] + RESULT_COLUMNS
 
 
 def make_dataset(race_ids: list[str], output_path: str | Path) -> pd.DataFrame:
@@ -151,9 +161,14 @@ def collect_races(
         label = f"[{i}/{len(races)}] {date.date()} {int(race_id[10:12])}R (race_id={race_id})"
 
         if path.exists() and not overwrite:
-            print(f"{label}: 保存済みのため読み込みのみ -> {path}")
-            tables.append(pd.read_csv(path, encoding="utf-8-sig", dtype={"race_id": str}, parse_dates=["race_date"]))
-            continue
+            saved = pd.read_csv(path, encoding="utf-8-sig", dtype={"race_id": str}, parse_dates=["race_date"])
+            missing = [c for c in output_columns() if c not in saved.columns]
+            if not missing:
+                print(f"{label}: 保存済みのため読み込みのみ -> {path}")
+                tables.append(saved)
+                continue
+            # 列を追加する前に保存した古い CSV は取り直す
+            print(f"{label}: 保存済みの CSV に列 {missing} がないため取り直します")
 
         print(f"{label}: 取得中...")
         try:
