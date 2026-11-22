@@ -10,8 +10,9 @@ netkeiba から取得した出馬表・結果・過去戦績・血統をもと�
     >>> df = collect_races("東京", "2026-11-01", "2026-11-22", race_numbers=range(7, 13))
 
 テーブルの列:
-    識別用   : race_id, race_date, umaban
-    特徴量   : レースの場所・距離区分・芝/ダート, 馬ごとの情報, 条件別平均着順, 血統 (ID なし)
+    識別用   : race_id, race_date, umaban, horse_name (馬名は過学習を防ぐため特徴量にしない)
+    特徴量   : レースの場所・距離区分・芝/ダート・馬場状態・出走頭数, 馬ごとの情報 (枠番含む),
+               条件別の平均着順と出走回数, 血統 (ID なし)
     目的変数 : is_top3 (3 着以内なら 1, それ以外は 0. 結果未確定のレースは欠損)
     参考     : rank (着順)
     馬券用   : win_odds (確定単勝オッズ), popularity (人気)
@@ -33,14 +34,22 @@ from racing_prediction.features.build_features import (
     add_avg_rank_features,
     avg_rank_feature_names,
     distance_category,
+    n_starts_feature_names,
 )
 
-ID_COLUMNS = ["race_id", "race_date", "umaban"]
+# 馬名は馬ごとに一意で, 特徴量にするとモデルが丸暗記して新馬に効かないため識別用にする
+ID_COLUMNS = ["race_id", "race_date", "umaban", "horse_name"]
 
-RACE_FEATURE_COLUMNS = ["race_venue", "race_distance_category", "race_surface", "race_track_condition"]
+RACE_FEATURE_COLUMNS = [
+    "race_venue",
+    "race_distance_category",
+    "race_surface",
+    "race_track_condition",
+    "n_horses",  # 出走頭数 (取消・除外を除く)
+]
 
 HORSE_FEATURE_COLUMNS = [
-    "horse_name",
+    "waku",  # 枠番
     "sex",
     "age",
     "weight_carried",
@@ -63,7 +72,13 @@ NOT_STARTED = ("取消", "除外")
 
 def feature_columns() -> list[str]:
     """モデルに入れる特徴量の列名一覧."""
-    return RACE_FEATURE_COLUMNS + HORSE_FEATURE_COLUMNS + avg_rank_feature_names() + PEDIGREE_FEATURE_COLUMNS
+    return (
+        RACE_FEATURE_COLUMNS
+        + HORSE_FEATURE_COLUMNS
+        + avg_rank_feature_names()
+        + n_starts_feature_names()
+        + PEDIGREE_FEATURE_COLUMNS
+    )
 
 
 def build_race_table(race_id: str) -> pd.DataFrame:
@@ -81,6 +96,7 @@ def build_race_table(race_id: str) -> pd.DataFrame:
     # 取消・除外の馬は出走していないので除く (中止・失格は出走扱いで is_top3 = 0)
     not_started = df["is_canceled"] | df["rank_text"].isin(NOT_STARTED)
     df = df[~not_started].copy()
+    df["n_horses"] = len(df)
 
     result_fixed = df["rank_text"].notna().any()
     if result_fixed:
