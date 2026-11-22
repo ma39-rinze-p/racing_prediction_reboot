@@ -20,6 +20,7 @@ import pandas as pd
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
 from racing_prediction.data.make_dataset import TARGET_COLUMN
+from racing_prediction.features.feature_labels import feature_label_ja
 from racing_prediction.features.model_features import FeatureBuilder
 
 TOP_N = 3  # 3 着以内
@@ -167,6 +168,8 @@ def feature_importance(
 ) -> pd.DataFrame:
     """特徴量の重要度を重要度の高い順に並べた DataFrame を返す.
 
+    feature    : 特徴量の名前 (英語)
+    feature_ja : 特徴量の日本語名
     gain       : その特徴量で分岐したときの損失の減少量の合計 (LightGBM 標準の重要度)
     gain_share : gain の全体に占める割合
     split      : 分岐に使われた回数
@@ -178,6 +181,7 @@ def feature_importance(
     imp = pd.DataFrame(
         {
             "feature": names,
+            "feature_ja": [feature_label_ja(n) for n in names],
             "gain": gain,
             "gain_share": gain / gain.sum() if gain.sum() > 0 else 0.0,
             "split": booster.feature_importance("split"),

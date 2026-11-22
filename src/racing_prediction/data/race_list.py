@@ -76,6 +76,49 @@ def fetch_race_ids_on(date: pd.Timestamp) -> list[str]:
     return sorted(set(re.findall(r"race_id=(\d{12})", response.text)))
 
 
+def parse_race_schedule_html(html: str, date: pd.Timestamp) -> pd.DataFrame:
+    """開催日のレース一覧ページから, その日の全レースの時刻表を作る.
+
+    Returns:
+        race_id, venue (競馬場名), race_number, race_name, course (例: "ダ1400m"),
+        start_time (発走時刻, 日本時間) の DataFrame
+    """
+    code_to_venue = {code: name for name, code in VENUE_CODES.items()}
+    rows = []
+    soup = BeautifulSoup(html, "html.parser")
+    for item in soup.select("li.RaceList_DataItem"):
+        a = item.find("a", href=re.compile(r"race_id=\d{12}"))
+        time_span = item.select_one("span.RaceList_Itemtime")
+        if a is None or time_span is None:
+            continue
+        race_id = re.search(r"race_id=(\d{12})", a["href"]).group(1)
+        tm = re.search(r"(\d{1,2}):(\d{2})", time_span.get_text())
+        if tm is None:
+            continue
+        title = item.select_one("span.ItemTitle")
+        course = item.select_one("span.RaceList_ItemLong")
+        rows.append(
+            {
+                "race_id": race_id,
+                "venue": code_to_venue.get(race_id[4:6], race_id[4:6]),
+                "race_number": int(race_id[10:12]),
+                "race_name": title.get_text(strip=True) if title else "",
+                "course": course.get_text(strip=True) if course else "",
+                "start_time": date.normalize() + pd.Timedelta(hours=int(tm.group(1)), minutes=int(tm.group(2))),
+            }
+        )
+    columns = ["race_id", "venue", "race_number", "race_name", "course", "start_time"]
+    df = pd.DataFrame(rows, columns=columns).drop_duplicates("race_id")
+    return df.sort_values(["start_time", "race_id"], ignore_index=True)
+
+
+def fetch_race_schedule(date: str | pd.Timestamp) -> pd.DataFrame:
+    """開催日の全レースの時刻表 (race_id, 競馬場, レース番号, レース名, 発走時刻) を返す. 非開催日は空."""
+    date = pd.Timestamp(date)
+    response = polite_get(RACE_LIST_URL, params={"kaisai_date": date.strftime("%Y%m%d")})
+    return parse_race_schedule_html(response.text, date)
+
+
 def find_race_ids(
     venue: str,
     start_date: str | pd.Timestamp,

@@ -1,0 +1,82 @@
+# 毎朝 1 回, 今日が「対象レースがある日」かを判定し, 推論ワークフロー (race-inference) を有効 / 無効にする.
+#
+# - 対象レースがある日 → race-inference を有効にする (12:00〜 10 分おきに起動して予測する)
+# - 対象レースがない日 (非開催日, または対象の競馬場で開催がない日) → race-inference を無効にする
+#   (無効の間は 10 分おきの起動自体が行われないので, GitHub Actions の無料枠を消費しない)
+# - 時刻表の取得に失敗した場合は非開催日と判定せず, race-inference を有効にする
+#   (race-inference 側で時刻表の取得を再試行する)
+# - 取得した時刻表は状態ファイルとしてキャッシュに保存し, race-inference が引き継ぐ
+name: race-day-planner
+
+on:
+  schedule:
+    # UTC 2:40 = 日本時間 11:40 (race-inference の起動開始 12:00 より前). 毎日
+    - cron: "40 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write   # ワークフローの有効化・無効化, キャッシュの保存
+  contents: read
+
+env:
+  # race-inference と同じ設定を使う (Settings > Secrets and variables > Actions > Variables)
+  VENUES: ${{ vars.INFERENCE_VENUES }}
+  RACE_NUMBERS: ${{ vars.INFERENCE_RACE_NUMBERS || '7-12' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-inference.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-inference.txt
+
+      # 同じ日に手動で再実行した場合に, 通知済みの記録を消さないよう前回の状態を引き継ぐ
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .inference_state
+          key: inference-state-${{ github.run_id }}
+          restore-keys: inference-state-
+
+      - name: Fetch today's schedule
+        id: prepare
+        continue-on-error: true   # 取得に失敗しても次のステップで race-inference を有効にする
+        env:
+          PYTHONPATH: src
+        run: python -m racing_prediction.inference.run --prepare-only --venues "$VENUES" --race-numbers "$RACE_NUMBERS"
+
+      - name: Enable or disable race-inference
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RACE_DAY: ${{ steps.prepare.outputs.race_day }}
+        run: |
+          # すでに目的の状態ならそのまま (二重に無効化・有効化するとエラーになることがあるため)
+          current=$(gh workflow view race-inference.yml --json state --jq .state)
+          echo "race-inference の現在の状態: $current"
+          if [ "$RACE_DAY" = "false" ]; then
+            if [ "$current" = "active" ]; then gh workflow disable race-inference.yml; fi
+            echo "対象レースがないため race-inference を無効にしました"
+          else
+            if [ "$current" != "active" ]; then gh workflow enable race-inference.yml; fi
+            if [ "$RACE_DAY" = "true" ]; then
+              echo "対象レースがあるため race-inference を有効にしました"
+            else
+              echo "時刻表の取得に失敗したため, 念のため race-inference を有効にしました"
+            fi
+          fi
+
+      - name: Save state
+        if: always() && hashFiles('.inference_state/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .inference_state
+          key: inference-state-${{ github.run_id }}
