@@ -223,9 +223,10 @@ def build_report(
         else:
             wide_ev = wide_expected_values(wide, odds.odds, betting)
             positive_boxes, n_boxes_total = all_box_expected_values(pred, wide_ev)
-            # 的中率はメールに載せる分だけ計算する
-            boxes = add_box_hit_rates(positive_boxes.head(betting.box_max_display), pred, in_top)
-            boxes = pd.concat([boxes, positive_boxes.iloc[len(boxes):]], ignore_index=True)
+            # 期待値がプラスのボックスを, 的中率の高い順に並べる (同じ的中率なら期待回収率の高い順)
+            boxes = add_box_hit_rates(positive_boxes, pred, in_top).sort_values(
+                ["hit_rate", "return_rate"], ascending=[False, False], ignore_index=True
+            )
     except Exception as e:  # noqa: BLE001 - オッズが取れなくても予測は通知する
         odds_note = f"取得エラー: {type(e).__name__}"
         print(f"{race_info['race_id']}: ワイドのオッズを取得できませんでした: {e}")

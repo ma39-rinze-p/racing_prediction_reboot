@@ -134,15 +134,37 @@ def add_box_hit_rates(boxes: pd.DataFrame, race: pd.DataFrame, in_top: np.ndarra
     """ボックスごとの的中率 (ボックス内の 2 頭以上が 3 着以内に入る確率) を hit_rate 列として追加する.
 
     race と in_top (simulate_top3(race) の結果) は同じ行の順番であること.
+
+    シミュレーションを 1 つずつ数えると, ボックスが数万通りあるときに遅いため, 次の式で全ボックスを一度に計算する.
+    各シミュレーションでは 3 着以内の 3 頭 T が決まり, ボックス B と T の共通部分の頭数を a とすると
+        [a >= 2] = (B 内の 2 頭の組で, 2 頭とも T に入る組の数) - 2 × (B 内の 3 頭の組で, T と一致する組の数)
+    (a = 2 なら 1 - 0 = 1, a = 3 なら 3 - 2 = 1, a <= 1 なら 0). これを全シミュレーションで平均すると
+        的中率 = Σ_{B 内の 2 頭} P(2 頭とも 3 着以内) - 2 × Σ_{B 内の 3 頭} P(その 3 頭が 1〜3 着)
+    となり, シミュレーションで数えた結果と完全に一致する.
     """
     out = boxes.copy()
     if out.empty:
         out["hit_rate"] = pd.Series(dtype=float)
         return out
-    row_of = {int(u): i for i, u in enumerate(race.reset_index(drop=True)["umaban"])}
-    M = np.zeros((len(out), in_top.shape[1]), dtype=np.int32)
-    for k, box in enumerate(out["umabans"]):
-        M[k, [row_of[u] for u in box]] = 1
-    hits = in_top.astype(np.int32) @ M.T  # [シミュレーション, ボックス] = ボックス内で 3 着以内に入った頭数
-    out["hit_rate"] = (hits >= 2).mean(axis=0)
+
+    race = race.reset_index(drop=True)
+    n = len(race)
+    pos = {int(u): i for i, u in enumerate(race["umaban"])}
+    bits = np.int64(1) << np.arange(n, dtype=np.int64)
+    box_masks = np.array([sum(int(bits[pos[u]]) for u in box) for box in out["umabans"]], dtype=np.int64)
+    X = ((box_masks[:, None] >> np.arange(n)) & 1).astype(np.float64)
+
+    # 2 頭とも 3 着以内に入る確率 (シミュレーションでの割合)
+    sims = in_top.astype(np.float64)
+    pair_prob = sims.T @ sims / len(sims)
+    np.fill_diagonal(pair_prob, 0)
+    pair_term = ((X @ pair_prob) * X).sum(axis=1) / 2
+
+    # 3 頭がそのまま 1〜3 着を占める確率 (シミュレーションに出てきた 3 頭の組ごと. 18 頭立てでも最大 816 通り)
+    triple_masks, counts = np.unique((in_top.astype(np.int64) * bits).sum(axis=1), return_counts=True)
+    triple_term = np.zeros(len(out))
+    for t, c in zip(triple_masks, counts / len(in_top)):
+        triple_term[(box_masks & t) == t] += c
+
+    out["hit_rate"] = np.clip(pair_term - 2 * triple_term, 0, 1)
     return out

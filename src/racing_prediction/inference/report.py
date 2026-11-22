@@ -45,9 +45,9 @@ def _box_lines(
 ) -> tuple[list[str], int | None]:
     """期待値がプラスのボックスの欄と, その数を返す. オッズが取れなかった場合の数は None.
 
-    boxes: all_box_expected_values の結果に add_box_hit_rates で的中率を付けたもの (期待回収率の降順)
+    boxes: all_box_expected_values の結果に add_box_hit_rates で的中率を付けたもの (的中率の降順)
     """
-    lines = ["■ 期待値プラスのワイド ボックス (期待回収率の高い順)"]
+    lines = ["■ 期待値プラスのワイド ボックス (的中率の高い順)"]
     if boxes is None:
         return lines + [f"  オッズを取得できなかったため計算していません ({odds_note or '不明'})"], None
     if boxes.empty:
