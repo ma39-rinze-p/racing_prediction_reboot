@@ -1,6 +1,6 @@
 """optimize_bet
 
-ワイドの期待値の計算と, 期待値がプラスになるボックス買いの組み合わせの選択.
+ワイドの期待値の計算と, 出走馬で作れる全てのボックスの期待値の計算.
 
 期待値 (100 円あたりの期待利益) = 使う確率 × 最低オッズ − 1
     ワイドのオッズは「最低〜最高」の幅で発表され, 実際の払戻はその間になる.
@@ -16,6 +16,7 @@
     (この場合の期待値は控除率の分だけマイナスになる).
 
 ボックス買い (k 頭を選び, その中の全 k(k-1)/2 組を 100 円ずつ買う):
+    出走馬 (オッズがある馬) で作れる全てのボックス (2 頭〜全頭. 18 頭立てなら約 26 万通り) の期待値を計算する.
     期待払戻 = Σ (各組の p_used × 最低オッズ) × 100 円   (期待値は足し算できるので, 組同士が独立でなくても正確)
     的中率   = k 頭のうち 2 頭以上が 3 着以内に入る確率 (モデルのシミュレーションから計算)
 
@@ -23,8 +24,6 @@
 """
 
 from __future__ import annotations
-
-from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -66,70 +65,84 @@ def wide_expected_values(wide: pd.DataFrame, odds: pd.DataFrame, cfg: BettingCon
     return merged.sort_values("ev_min", ascending=False, ignore_index=True)
 
 
-def best_wide_boxes(
-    race: pd.DataFrame,
-    in_top: np.ndarray,
-    pair_ev: pd.DataFrame,
-    cfg: BettingConfig | None = None,
-) -> pd.DataFrame:
-    """頭数ごとに, ボックスの期待利益 (最低オッズで計算) が最大になる馬の組み合わせを探す.
+def all_box_expected_values(race: pd.DataFrame, pair_ev: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """出走馬 (オッズがある馬) で作れる全てのボックス (2 頭〜全頭) の期待値を計算し, 期待値がプラスのものを返す.
 
-    的中率が cfg.min_hit_rate 未満のボックスは選ばない.
+    ボックスの期待払戻 (100 円あたり) は, ボックスに含まれる全組み合わせの (p_used × 最低オッズ) の合計.
+    全ボックスを 0/1 の行列 X (1 行 = 1 つのボックス) で表し, 組み合わせの期待利益の行列 V を使って
+    期待利益 = x^T V x / 2 を一度に計算する (18 頭立てで約 26 万通りでも 1 秒かからない).
 
     Args:
-        race: predict_top3 の出力 (1 レース分). in_top と同じ行の順番であること
-        in_top: simulate_top3(race) の結果
+        race: predict_top3 の出力 (1 レース分)
         pair_ev: wide_expected_values の出力
 
     Returns:
-        1 行 = 1 つの頭数のボックス. box_size, umabans (馬番のタプル), horse_names, n_tickets (点数),
-        stake (購入額), expected_return (期待払戻), expected_profit (期待利益), return_rate (期待回収率),
-        hit_rate (的中率), positive_pairs (ボックス内で期待値がプラスの組数) を, 期待利益の降順で並べた DataFrame
+        (期待値がプラスのボックスの DataFrame, 計算したボックスの総数).
+        DataFrame の列: box_size, umabans (馬番のタプル), n_tickets (点数), stake (購入額), expected_return (期待払戻),
+        expected_profit (期待利益), return_rate (期待回収率). 期待回収率の降順.
     """
-    cfg = cfg or BettingConfig()
-    race = race.reset_index(drop=True)
-    row_of = {int(u): i for i, u in enumerate(race["umaban"])}
-    name_of = dict(zip(race["umaban"].astype(int), race["horse_name"]))
-    exp_return_of = {  # 組み合わせ -> 100 円あたりの期待払戻 (= 使う確率 × 最低オッズ)
-        (int(r.umaban_1), int(r.umaban_2)): r.p_used * r.odds_min for r in pair_ev.itertuples()
-    }
+    columns = ["box_size", "umabans", "n_tickets", "stake", "expected_return", "expected_profit", "return_rate"]
+    horses = sorted(set(pair_ev["umaban_1"].astype(int)) | set(pair_ev["umaban_2"].astype(int)))
+    n = len(horses)
+    if n < 2:
+        return pd.DataFrame(columns=columns), 0
+    pos = {u: i for i, u in enumerate(horses)}
 
-    # オッズがある馬の中から, 3 着以内の確率が高い順に候補を選ぶ
-    with_odds = {u for pair in exp_return_of for u in pair}
-    candidates = [int(u) for u in race.sort_values("p_top3", ascending=False)["umaban"] if int(u) in with_odds]
-    candidates = sorted(candidates[: cfg.max_candidates])
+    # 組み合わせごとの 100 円あたりの期待払戻 (= p_used × 最低オッズ). オッズがない組は買えないので NaN
+    exp_return = np.full((n, n), np.nan)
+    for r in pair_ev.itertuples():
+        i, j = pos[int(r.umaban_1)], pos[int(r.umaban_2)]
+        exp_return[i, j] = exp_return[j, i] = r.p_used * r.odds_min
+    missing = np.isnan(exp_return) & ~np.eye(n, dtype=bool)
+    profit = np.nan_to_num(exp_return - 1)  # 組み合わせごとの期待利益
+    np.fill_diagonal(profit, 0)
+    np.fill_diagonal(exp_return, 0)
+    exp_return = np.nan_to_num(exp_return)
 
-    rows = []
-    for k in cfg.box_sizes:
-        best = None
-        for box in combinations(candidates, k):
-            pairs = list(combinations(box, 2))
-            if any(p not in exp_return_of for p in pairs):
-                continue
-            hit_rate = float((in_top[:, [row_of[u] for u in box]].sum(axis=1) >= 2).mean())
-            if hit_rate < cfg.min_hit_rate:
-                continue
-            expected_return = sum(exp_return_of[p] for p in pairs)
-            profit = expected_return - len(pairs)
-            if best is None or profit > best["profit"]:
-                best = {"box": box, "profit": profit, "expected_return": expected_return, "pairs": pairs, "hit_rate": hit_rate}
-        if best is None:
-            continue
-        n_tickets = len(best["pairs"])
-        rows.append(
-            {
-                "box_size": k,
-                "umabans": best["box"],
-                "horse_names": tuple(name_of[u] for u in best["box"]),
-                "n_tickets": n_tickets,
-                "stake": n_tickets * STAKE_PER_TICKET,
-                "expected_return": best["expected_return"] * STAKE_PER_TICKET,
-                "expected_profit": best["profit"] * STAKE_PER_TICKET,
-                "return_rate": best["expected_return"] / n_tickets,
-                "hit_rate": best["hit_rate"],
-                "positive_pairs": sum(exp_return_of[p] > 1 for p in best["pairs"]),
-            }
-        )
-    columns = ["box_size", "umabans", "horse_names", "n_tickets", "stake", "expected_return",
-               "expected_profit", "return_rate", "hit_rate", "positive_pairs"]
-    return pd.DataFrame(rows, columns=columns).sort_values("expected_profit", ascending=False, ignore_index=True)
+    # 全ボックス (2 頭以上) を 0/1 の行列で表す
+    masks = np.arange(1 << n, dtype=np.int64)
+    X = ((masks[:, None] >> np.arange(n)) & 1).astype(np.float64)
+    sizes = X.sum(axis=1)
+    X, sizes = X[sizes >= 2], sizes[sizes >= 2]
+    if missing.any():  # オッズがない組を含むボックスは除く
+        has_missing = ((X @ missing.astype(np.float64)) * X).sum(axis=1) > 0
+        X, sizes = X[~has_missing], sizes[~has_missing]
+    total = len(X)
+
+    box_profit = ((X @ profit.astype(np.float64)) * X).sum(axis=1) / 2
+    keep = box_profit > 1e-9
+    X, sizes, box_profit = X[keep], sizes[keep], box_profit[keep]
+    box_return = ((X @ exp_return.astype(np.float64)) * X).sum(axis=1) / 2
+    n_tickets = sizes * (sizes - 1) / 2
+
+    result = pd.DataFrame(
+        {
+            "box_size": sizes.astype(int),
+            "umabans": [tuple(horses[i] for i in np.flatnonzero(x)) for x in X],
+            "n_tickets": n_tickets.astype(int),
+            "stake": (n_tickets * STAKE_PER_TICKET).astype(int),
+            "expected_return": box_return * STAKE_PER_TICKET,
+            "expected_profit": box_profit * STAKE_PER_TICKET,
+            "return_rate": box_return / n_tickets,
+        },
+        columns=columns,
+    )
+    return result.sort_values(["return_rate", "box_size"], ascending=[False, True], ignore_index=True), total
+
+
+def add_box_hit_rates(boxes: pd.DataFrame, race: pd.DataFrame, in_top: np.ndarray) -> pd.DataFrame:
+    """ボックスごとの的中率 (ボックス内の 2 頭以上が 3 着以内に入る確率) を hit_rate 列として追加する.
+
+    race と in_top (simulate_top3(race) の結果) は同じ行の順番であること.
+    """
+    out = boxes.copy()
+    if out.empty:
+        out["hit_rate"] = pd.Series(dtype=float)
+        return out
+    row_of = {int(u): i for i, u in enumerate(race.reset_index(drop=True)["umaban"])}
+    M = np.zeros((len(out), in_top.shape[1]), dtype=np.int32)
+    for k, box in enumerate(out["umabans"]):
+        M[k, [row_of[u] for u in box]] = 1
+    hits = in_top.astype(np.int32) @ M.T  # [シミュレーション, ボックス] = ボックス内で 3 着以内に入った頭数
+    out["hit_rate"] = (hits >= 2).mean(axis=0)
+    return out

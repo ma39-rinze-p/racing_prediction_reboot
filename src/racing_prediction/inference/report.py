@@ -36,31 +36,32 @@ def _course(race_info: dict, pred: pd.DataFrame) -> tuple[str, str]:
     return SURFACE_JA.get(surface, "不明"), "不明"
 
 
-def _ev_lines(wide_ev: pd.DataFrame | None, pred: pd.DataFrame, odds_note: str | None) -> tuple[list[str], int | None]:
-    """期待値がプラスのワイドを全て (期待値の高い順に) 並べた欄と, その組数を返す.
+def _box_label(umabans) -> str:
+    return "".join(circled(int(u)) for u in umabans)
 
-    各組み合わせに, モデルの的中確率とオッズ (最低〜最高), 各馬の予測順位を併記する.
-    オッズが取れなかった場合の組数は None.
+
+def _box_lines(
+    boxes: pd.DataFrame | None, n_total: int | None, max_display: int, odds_note: str | None
+) -> tuple[list[str], int | None]:
+    """期待値がプラスのボックスの欄と, その数を返す. オッズが取れなかった場合の数は None.
+
+    boxes: all_box_expected_values の結果に add_box_hit_rates で的中率を付けたもの (期待回収率の降順)
     """
-    lines = ["■ 期待値プラスのワイド (期待値の高い順)"]
-    if wide_ev is None:
+    lines = ["■ 期待値プラスのワイド ボックス (期待回収率の高い順)"]
+    if boxes is None:
         return lines + [f"  オッズを取得できなかったため計算していません ({odds_note or '不明'})"], None
+    if boxes.empty:
+        return lines + [f"  全{n_total:,}通りを計算しましたが, 期待値がプラスのボックスはありません (見送り推奨)"], 0
 
-    positive = wide_ev[wide_ev["ev_min"] > 0]
-    if positive.empty:
-        return lines + ["  期待値がプラスの組み合わせはありません (見送り推奨)"], 0
-
-    rank_of = dict(zip(pred["umaban"].astype(int), pred["pred_rank"].astype(int)))
-    name_of = dict(zip(pred["umaban"].astype(int), pred["horse_name"]))
-    lines.append(f"  {len(positive)}組 / 購入額 {len(positive) * 100:,}円 (各100円の場合)")
-    for _, w in positive.iterrows():
-        u1, u2 = int(w["umaban_1"]), int(w["umaban_2"])
+    shown = boxes.head(max_display)
+    header = f"  全{n_total:,}通り中 {len(boxes):,}通りが期待値プラス"
+    lines.append(header + (f" (上位{len(shown)}通りを表示)" if len(boxes) > len(shown) else ""))
+    for i, b in enumerate(shown.itertuples(), start=1):
         lines += [
-            f"{circled(u1)}-{circled(u2)} 期待値{w['ev_min']:+.0%}",
-            f"  モデル確率 {w['p_wide']:.1%} / オッズ {w['odds_min']:.1f}〜{w['odds_max']:.1f}倍",
-            f"  {name_of.get(u1, '')}(予測{rank_of.get(u1, '-')}位) / {name_of.get(u2, '')}(予測{rank_of.get(u2, '-')}位)",
+            f"{i:>2}. {_box_label(b.umabans)} {b.box_size}頭 {b.n_tickets}点/{b.stake:,}円",
+            f"    期待払戻{b.expected_return:,.0f}円 回収率{b.return_rate:.0%} 的中率{b.hit_rate:.0%}",
         ]
-    return lines, len(positive)
+    return lines, len(boxes)
 
 
 def format_race_report(
@@ -68,7 +69,9 @@ def format_race_report(
     pred: pd.DataFrame,
     wide: pd.DataFrame,
     n_wide: int = 5,
-    wide_ev: pd.DataFrame | None = None,
+    boxes: pd.DataFrame | None = None,
+    n_boxes_total: int | None = None,
+    max_display: int = 20,
     odds_note: str | None = None,
 ) -> tuple[str, str]:
     """1 レース分の (件名, 本文) を作る.
@@ -77,7 +80,9 @@ def format_race_report(
         race_info: venue, race_number, race_name, course, start_time を持つ dict (時刻表の 1 行)
         pred: predict_top3 の出力 (1 レース分)
         wide: wide_probabilities の出力
-        wide_ev: wide_expected_values の出力 (オッズが取れなかったときは None)
+        boxes: 期待値がプラスのボックス (all_box_expected_values + add_box_hit_rates. オッズが取れなかったときは None)
+        n_boxes_total: 期待値を計算したボックスの総数
+        max_display: メールに載せるボックスの最大数
         odds_note: オッズの取得時刻・状態など (本文に表示する)
     """
     first = pred.iloc[0]
@@ -106,9 +111,9 @@ def format_race_report(
     if pred["horse_weight"].isna().all():
         lines += ["※ 馬体重が未発表の状態で予測しています", ""]
 
-    ev_lines, n_positive = _ev_lines(wide_ev, pred, odds_note)
-    lines += ev_lines + [""]
-    if wide_ev is not None and odds_note:
+    box_lines, n_positive = _box_lines(boxes, n_boxes_total, max_display, odds_note)
+    lines += box_lines + [""]
+    if boxes is not None and odds_note:
         lines += [f"※ オッズは {odds_note}. 締切までに変わります", ""]
 
     lines.append("■ 3着以内に入る確率")
@@ -124,11 +129,12 @@ def format_race_report(
 
     lines += [
         "",
-        "※ 期待値 = 確率 × 最低オッズ − 1. 確率はモデルの確率とオッズから逆算した市場の確率を組み合わせたもの",
-        "  (オッズ50倍超・モデル確率5%未満の組は市場の確率のみ. configs/betting.yaml) のため, モデル確率 × オッズとは一致しません.",
+        "※ ボックスの期待払戻 = 含まれる各組の (確率 × 最低オッズ × 100円) の合計. 確率はモデルの確率と",
+        "  オッズから逆算した市場の確率を組み合わせたもの (オッズ50倍超・モデル確率5%未満の組は市場の確率のみ.",
+        "  configs/betting.yaml). 的中率はボックス内の2頭以上が3着以内に入る確率 (モデル).",
         "※ 予測は参考情報であり, 馬券の的中・利益を保証するものではありません.",
     ]
     course_short = surface if distance == "不明" else f"{surface}{distance}"
-    ev_label = "" if n_positive is None else (f" 期待値+{n_positive}組" if n_positive else " 期待値+なし")
+    ev_label = "" if n_positive is None else (f" 期待値+ボックス{n_positive:,}通り" if n_positive else " 期待値+なし")
     subject = f"【予想】{date_short} {title} {course_short} {start}発走{ev_label}"
     return subject, "\n".join(lines)

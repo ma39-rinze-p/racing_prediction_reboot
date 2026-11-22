@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from racing_prediction.betting.optimize_bet import wide_expected_values
+from racing_prediction.betting.optimize_bet import add_box_hit_rates, all_box_expected_values, wide_expected_values
 from racing_prediction.config import BettingConfig, load_betting_config
 from racing_prediction.data.make_dataset import build_race_table
 from racing_prediction.data.race_list import fetch_race_schedule, venue_code
@@ -141,7 +141,7 @@ def complete_race_info(race_info: dict, table: pd.DataFrame) -> dict:
 
 
 def predict_race(race_info: dict, booster, builder, betting: BettingConfig | None = None) -> tuple[str, str]:
-    """1 レースを取得・予測し, その時点のワイドのオッズから組み合わせごとの期待値を計算して,
+    """1 レースを取得・予測し, その時点のワイドのオッズから全ボックスの期待値を計算して,
     通知の (件名, 本文) を返す. オッズが取れなくても, 予測だけで通知する.
     """
     table = build_race_table(race_info["race_id"])
@@ -150,7 +150,8 @@ def predict_race(race_info: dict, booster, builder, betting: BettingConfig | Non
     in_top = simulate_top3(pred)
     wide = wide_probabilities(pred, in_top=in_top)
 
-    wide_ev = None
+    betting = betting or BettingConfig()
+    boxes = n_boxes_total = None
     try:
         odds = fetch_wide_odds(race_info["race_id"])
         status = {"middle": "発売中", "result": "確定"}.get(odds.status, odds.status or "状態不明")
@@ -159,10 +160,17 @@ def predict_race(race_info: dict, booster, builder, betting: BettingConfig | Non
             odds_note = f"ワイドのオッズがまだありません ({status})"
         else:
             wide_ev = wide_expected_values(wide, odds.odds, betting)
+            positive_boxes, n_boxes_total = all_box_expected_values(pred, wide_ev)
+            # 的中率はメールに載せる分だけ計算する
+            boxes = add_box_hit_rates(positive_boxes.head(betting.box_max_display), pred, in_top)
+            boxes = pd.concat([boxes, positive_boxes.iloc[len(boxes):]], ignore_index=True)
     except Exception as e:  # noqa: BLE001 - オッズが取れなくても予測は通知する
         odds_note = f"取得エラー: {type(e).__name__}"
         print(f"{race_info['race_id']}: ワイドのオッズを取得できませんでした: {e}")
-    return format_race_report(race_info, pred, wide, wide_ev=wide_ev, odds_note=odds_note)
+    return format_race_report(
+        race_info, pred, wide, boxes=boxes, n_boxes_total=n_boxes_total,
+        max_display=betting.box_max_display, odds_note=odds_note,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
