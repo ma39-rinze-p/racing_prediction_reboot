@@ -59,14 +59,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RACE_DAY: ${{ steps.prepare.outputs.race_day }}
         run: |
+          # GitHub の REST API を直接呼ぶ (gh workflow view の --json は gh のバージョンによって使えないため)
+          api="repos/${GITHUB_REPOSITORY}/actions/workflows/race-inference.yml"
           # すでに目的の状態ならそのまま (二重に無効化・有効化するとエラーになることがあるため)
-          current=$(gh workflow view race-inference.yml --json state --jq .state)
+          current=$(gh api "$api" --jq .state)
           echo "race-inference の現在の状態: $current"
           if [ "$RACE_DAY" = "false" ]; then
-            if [ "$current" = "active" ]; then gh workflow disable race-inference.yml; fi
+            if [ "$current" = "active" ]; then gh api -X PUT "$api/disable"; fi
             echo "対象レースがないため race-inference を無効にしました"
           else
-            if [ "$current" != "active" ]; then gh workflow enable race-inference.yml; fi
+            if [ "$current" != "active" ]; then gh api -X PUT "$api/enable"; fi
             if [ "$RACE_DAY" = "true" ]; then
               echo "対象レースがあるため race-inference を有効にしました"
             else

@@ -120,7 +120,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$(gh workflow view race-inference.yml --json state --jq .state)" = "active" ]; then
-            gh workflow disable race-inference.yml
+          # GitHub の REST API を直接呼ぶ (gh workflow view の --json は gh のバージョンによって使えないため)
+          api="repos/${GITHUB_REPOSITORY}/actions/workflows/race-inference.yml"
+          if [ "$(gh api "$api" --jq .state)" = "active" ]; then
+            gh api -X PUT "$api/disable"
           fi
           echo "今日予測できる対象レースが残っていないため race-inference を無効にしました"
