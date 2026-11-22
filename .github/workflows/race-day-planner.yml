@@ -28,9 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -41,7 +41,7 @@ jobs:
 
       # 同じ日に手動で再実行した場合に, 通知済みの記録を消さないよう前回の状態を引き継ぐ
       - name: Restore state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .inference_state
           key: inference-state-${{ github.run_id }}
@@ -76,7 +76,7 @@ jobs:
 
       - name: Save state
         if: always() && hashFiles('.inference_state/**') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .inference_state
           key: inference-state-${{ github.run_id }}
