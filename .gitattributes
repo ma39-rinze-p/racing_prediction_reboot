@@ -1,0 +1,11 @@
+# 改行コードを自動変換しないファイル.
+# Windows の git は core.autocrlf=true だと取り出し時に LF を CRLF に変換するが,
+# LightGBM のモデル (model.txt) は各木の長さをバイト数で持つため, 変換されると読み込めなくなる.
+models/**/model.txt -text
+models/**/*.json -text
+models/**/*.csv -text
+
+# バイナリファイル
+*.png binary
+*.ttf binary
+*.otf binary

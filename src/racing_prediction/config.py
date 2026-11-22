@@ -34,6 +34,51 @@ class TrainConfig:
         return d
 
 
+@dataclass(frozen=True)
+class BettingConfig:
+    """ワイドの期待値とおすすめボックスの設定 (configs/betting.yaml)."""
+
+    market_weight: float = 0.5
+    max_odds: float = 50.0
+    min_model_prob: float = 0.05
+    box_sizes: tuple[int, ...] = (2, 3, 4, 5)
+    max_candidates: int = 8
+    min_hit_rate: float = 0.2
+
+
+def load_betting_config(path: str | Path | None) -> BettingConfig:
+    """configs/betting.yaml を読み込む. ファイルがなければ既定値を使う."""
+    if path is None or not Path(path).exists():
+        return BettingConfig()
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    wide, box = raw.get("wide") or {}, raw.get("box") or {}
+    default = BettingConfig()
+    cfg = BettingConfig(
+        market_weight=float(wide.get("market_weight", default.market_weight)),
+        max_odds=float(wide.get("max_odds", default.max_odds)),
+        min_model_prob=float(wide.get("min_model_prob", default.min_model_prob)),
+        box_sizes=tuple(int(k) for k in box.get("sizes", default.box_sizes)),
+        max_candidates=int(box.get("max_candidates", default.max_candidates)),
+        min_hit_rate=float(box.get("min_hit_rate", default.min_hit_rate)),
+    )
+    errors = []
+    if not 0 <= cfg.market_weight <= 1:
+        errors.append(f"wide.market_weight は 0〜1 にしてください: {cfg.market_weight}")
+    if cfg.max_odds <= 1:
+        errors.append(f"wide.max_odds は 1 より大きくしてください: {cfg.max_odds}")
+    if not 0 <= cfg.min_model_prob < 1:
+        errors.append(f"wide.min_model_prob は 0 以上 1 未満にしてください: {cfg.min_model_prob}")
+    if not cfg.box_sizes or any(k < 2 for k in cfg.box_sizes):
+        errors.append(f"box.sizes は 2 以上の頭数のリストにしてください: {list(cfg.box_sizes)}")
+    if cfg.max_candidates < max(cfg.box_sizes or (2,)):
+        errors.append(f"box.max_candidates ({cfg.max_candidates}) は box.sizes の最大値以上にしてください")
+    if not 0 <= cfg.min_hit_rate < 1:
+        errors.append(f"box.min_hit_rate は 0 以上 1 未満にしてください: {cfg.min_hit_rate}")
+    if errors:
+        raise ValueError(f"{path} の設定に誤りがあります:\n  " + "\n  ".join(errors))
+    return cfg
+
+
 def _date(value, name: str) -> pd.Timestamp | None:
     if value is None:
         return None

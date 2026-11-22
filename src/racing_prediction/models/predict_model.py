@@ -32,7 +32,10 @@ TOP_N = 3  # 3 着以内
 def load_artifacts(model_dir: str | Path) -> tuple[lgb.Booster, FeatureBuilder, dict]:
     """save_artifacts で保存したモデル・前処理・メタデータを読み込む."""
     model_dir = Path(model_dir)
-    booster = lgb.Booster(model_file=str(model_dir / "model.txt"))
+    # model.txt は各木の長さをバイト数で持つため, Windows の git (core.autocrlf=true) などで改行が CRLF に
+    # 変換されると "Model format error" で読めなくなる. 改行を LF に揃えてから読み込む
+    model_str = (model_dir / "model.txt").read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+    booster = lgb.Booster(model_str=model_str)
     metadata = json.loads((model_dir / "metadata.json").read_text(encoding="utf-8"))
     builder = FeatureBuilder.from_dict(metadata["feature_builder"])
     return booster, builder, metadata
@@ -62,27 +65,20 @@ def predict_top3(df: pd.DataFrame, booster: lgb.Booster, builder: FeatureBuilder
     return out
 
 
-def wide_probabilities(
-    race: pd.DataFrame,
-    n_sims: int = 20000,
-    n_iter: int = 30,
-    seed: int = 0,
-) -> pd.DataFrame:
-    """1 レース分の予測 (predict_top3 の出力) から, 全組み合わせのワイド的中確率を計算する.
+def simulate_top3(race: pd.DataFrame, n_sims: int = 20000, n_iter: int = 30, seed: int = 0) -> np.ndarray:
+    """1 レース分の予測 (predict_top3 の出力) から, レース結果を n_sims 回シミュレーションする.
 
     各馬の「強さ」を, シミュレーションした 3 着以内率が p_top3 に一致するよう反復調整し,
     その強さで Plackett-Luce モデルに従ってレースを n_sims 回シミュレーションする.
     (Gumbel ノイズを加えて並べ替えると Plackett-Luce の着順サンプルになる)
 
     Returns:
-        umaban_1, umaban_2, horse_name_1, horse_name_2, p_wide を p_wide の降順で並べた DataFrame
+        (n_sims, 頭数) の bool 配列. [s, i] = s 回目のシミュレーションで race の i 行目の馬が 3 着以内か
     """
     race = race.reset_index(drop=True)
     p = race["p_top3"].to_numpy(dtype=float)
     n = len(p)
     k = min(TOP_N, n)
-    if n < 2:
-        return pd.DataFrame(columns=["umaban_1", "umaban_2", "horse_name_1", "horse_name_2", "p_wide"])
 
     rng = np.random.default_rng(seed)
     gumbel = rng.gumbel(size=(n_sims, n))  # 反復中は同じノイズを使う (調整を安定させるため)
@@ -95,9 +91,33 @@ def wide_probabilities(
         np.put_along_axis(in_top, top, True, axis=1)
         p_sim = np.clip(in_top.mean(axis=0), 1e-4, None)
         log_strength += np.log(p_target / p_sim)
+    return in_top
+
+
+def wide_probabilities(
+    race: pd.DataFrame,
+    n_sims: int = 20000,
+    n_iter: int = 30,
+    seed: int = 0,
+    in_top: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """1 レース分の予測 (predict_top3 の出力) から, 全組み合わせのワイド的中確率を計算する.
+
+    各馬の確率の積ではなく, simulate_top3 のシミュレーションで「2 頭とも 3 着以内」になった割合を使う.
+    in_top (simulate_top3 の結果) を渡せば, シミュレーションをやり直さずに使う.
+
+    Returns:
+        umaban_1, umaban_2, horse_name_1, horse_name_2, p_wide を p_wide の降順で並べた DataFrame
+    """
+    race = race.reset_index(drop=True)
+    n = len(race)
+    if n < 2:
+        return pd.DataFrame(columns=["umaban_1", "umaban_2", "horse_name_1", "horse_name_2", "p_wide"])
+    if in_top is None:
+        in_top = simulate_top3(race, n_sims=n_sims, n_iter=n_iter, seed=seed)
 
     in_top = in_top.astype(float)
-    pair = in_top.T @ in_top / n_sims
+    pair = in_top.T @ in_top / len(in_top)
 
     rows = [
         {
