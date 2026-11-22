@@ -73,8 +73,11 @@ def format_race_report(
     n_boxes_total: int | None = None,
     max_display: int = 20,
     odds_note: str | None = None,
+    label: str | None = None,
 ) -> tuple[str, str]:
     """1 レース分の (件名, 本文) を作る.
+
+    label: 通知のタイミング ("発走12分前" など). 件名と本文の先頭に入れる.
 
     Args:
         race_info: venue, race_number, race_name, course, start_time を持つ dict (時刻表の 1 行)
@@ -97,7 +100,8 @@ def format_race_report(
     title = f"{venue}{race_info['race_number']}R {race_name}"
 
     condition = TRACK_CONDITION_JA.get(first.get("race_track_condition"), "未発表")
-    lines = [
+    lines = [f"【{label}のオッズで計算】", ""] if label else []
+    lines += [
         "■ レース情報",
         f"開催日: {date_ja}",
         f"会場: {venue} {race_info['race_number']}R",
@@ -136,5 +140,6 @@ def format_race_report(
     ]
     course_short = surface if distance == "不明" else f"{surface}{distance}"
     ev_label = "" if n_positive is None else (f" 期待値+ボックス{n_positive:,}通り" if n_positive else " 期待値+なし")
-    subject = f"【予想】{date_short} {title} {course_short} {start}発走{ev_label}"
+    prefix = f"【予想・{label}】" if label else "【予想】"
+    subject = f"{prefix}{date_short} {title} {course_short} {start}発走{ev_label}"
     return subject, "\n".join(lines)

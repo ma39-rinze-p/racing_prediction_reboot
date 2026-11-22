@@ -1,13 +1,16 @@
-# 発走前に 3 着以内の確率とワイドの確率を予測して通知する.
+# 発走前に予測し, 発走直前のオッズで期待値プラスのワイド ボックスを計算して通知する.
 #
-# - 毎日 12:00〜16:50 (日本時間) に 10 分おきに起動し, 発走 50〜10 分前のレースを予測する
-#   (馬体重は発走 60 分前に発表される).
+# - 開催日の 12:00〜16:55 (日本時間) に 5 分おきに起動する.
+#     - 予測: 発走 50〜14 分前のレースを予測して状態ファイルに保存する (馬体重は発走 60 分前に発表される)
+#     - 通知: 「発走 12 分前」(Variables の NOTIFY_MINUTES_BEFORE で変更可) の時点の
+#       オッズで期待値を計算してメールを送る (1 レース 1 通). 起動から 7 分先までの通知のタイミングは,
+#       その時刻まで待って送る (GitHub Actions の起動は数分〜十数分遅れることがあり, 時刻ちょうどに起動できないため)
 #   土日だけでなく, 祝日開催・代替開催 (例: 2026-02-10 火曜) にも対応するため曜日では絞らない.
 # - 無料枠の節約のため, 起動が必要な日だけ有効にする:
 #     - 毎朝 race-day-planner が時刻表を取得し, 対象レースがある日だけこのワークフローを有効にする
 #       (非開催日は無効にするので, 10 分おきの起動自体が行われない)
-#     - その日に予測できる対象レースが残っていなくなったら (最終レース後など), このワークフローが自分を無効にする
-# - 各起動では, 状態ファイル (時刻表・通知済みレース) だけで「今予測するレースがあるか」を判定し,
+#     - その日に送る通知が残っていなくなったら (最終レース後など), このワークフローが自分を無効にする
+# - 各起動では, 状態ファイル (時刻表・予測結果・送った通知) だけで「今予測・通知するものがあるか」を判定し,
 #   なければ重いライブラリのインストール前に終了する.
 # - 無効になっているときに手動実行 (Run workflow) したい場合は, Actions 画面で先に「Enable workflow」を押す.
 # - 予測に使うモデルは models/production/ (model.txt, metadata.json) をリポジトリに置く.
@@ -17,12 +20,12 @@ name: race-inference
 
 on:
   schedule:
-    # UTC で指定 (UTC 3:00〜7:50 = 日本時間 12:00〜16:50). 毎日
-    - cron: "*/10 3-7 * * *"
+    # UTC で指定 (UTC 3:00〜7:55 = 日本時間 12:00〜16:55). 毎日 (非開催日は race-day-planner が無効にする)
+    - cron: "*/5 3-7 * * *"
   workflow_dispatch:
     inputs:
       race_id:
-        description: "時刻に関係なく予測するレース ID (空なら通常どおり発走が近いレース)"
+        description: "時刻に関係なく, 今のオッズで予測・通知するレース ID (空なら通常どおり)"
         required: false
         default: ""
       dry_run:
@@ -43,11 +46,13 @@ env:
   # 対象の競馬場・レース番号 (Settings > Secrets and variables > Actions > Variables で変更できる)
   VENUES: ${{ vars.INFERENCE_VENUES }}
   RACE_NUMBERS: ${{ vars.INFERENCE_RACE_NUMBERS || '7-12' }}
+  # オッズを取得して通知するタイミング (発走何分前. カンマ区切り)
+  NOTIFY_MINUTES_BEFORE: ${{ vars.NOTIFY_MINUTES_BEFORE || '12' }}
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 30   # 通知のタイミングまで最大 7 分待つ + 予測 (1 レース 1〜2 分)
     steps:
       - uses: actions/checkout@v7
 
@@ -69,7 +74,8 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "レース ID が指定されたため実行します: $RACE_ID"
           else
-            python3 src/racing_prediction/inference/precheck.py --venues "$VENUES" --race-numbers "$RACE_NUMBERS"
+            python3 src/racing_prediction/inference/precheck.py --venues "$VENUES" --race-numbers "$RACE_NUMBERS" \
+              --odds-minutes-before "$NOTIFY_MINUTES_BEFORE"
           fi
 
       - uses: actions/setup-python@v7
@@ -96,7 +102,7 @@ jobs:
           RACE_ID: ${{ inputs.race_id }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          args=(--venues "$VENUES" --race-numbers "$RACE_NUMBERS")
+          args=(--venues "$VENUES" --race-numbers "$RACE_NUMBERS" --odds-minutes-before "$NOTIFY_MINUTES_BEFORE")
           if [ -n "$RACE_ID" ]; then args+=(--race-id "$RACE_ID"); fi
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
           python -m racing_prediction.inference.run "${args[@]}"
@@ -108,12 +114,14 @@ jobs:
           path: .inference_state
           key: inference-state-${{ github.run_id }}
 
-      # 今日これから予測できる対象レースが残っていなければ (非開催日・最終レース後など),
+      # 今日これから送る通知が残っていなければ (非開催日・最終レース後など),
       # このワークフローを無効にして以降の起動を止める. 翌日以降は race-day-planner が必要な日に有効に戻す.
       - name: Check remaining races
         id: remaining
         if: always() && github.event_name == 'schedule'
-        run: python3 src/racing_prediction/inference/precheck.py --venues "$VENUES" --race-numbers "$RACE_NUMBERS"
+        run: |
+          python3 src/racing_prediction/inference/precheck.py --venues "$VENUES" --race-numbers "$RACE_NUMBERS" \
+            --odds-minutes-before "$NOTIFY_MINUTES_BEFORE"
 
       - name: Disable for the rest of the day if no races remain
         if: always() && github.event_name == 'schedule' && steps.remaining.outputs.remaining == 'false'
@@ -125,4 +133,4 @@ jobs:
           if [ "$(gh api "$api" --jq .state)" = "active" ]; then
             gh api -X PUT "$api/disable"
           fi
-          echo "今日予測できる対象レースが残っていないため race-inference を無効にしました"
+          echo "今日送る通知が残っていないため race-inference を無効にしました"
