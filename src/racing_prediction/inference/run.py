@@ -277,7 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--predict-minutes-before-max", type=float, default=50, help="発走何分前から予測するか")
     # 5 分おきの起動で取りこぼさない範囲で小さくする (待機時間も GitHub Actions の実行時間に数えられるため)
     parser.add_argument("--lookahead", type=float, default=7, help="今から何分先までの通知のタイミングを, 待って処理するか")
-    parser.add_argument("--late-tolerance", type=float, default=3, help="通知のタイミングを何分過ぎていても送るか")
+    # GitHub Actions の定期実行は混雑時に 15〜20 分起動しないことがあるため, 遅れても発走前なら送れるよう広めにとる
+    # (発走 12 分前の通知なら, 発走 3 分前までに起動できれば送る. lookahead と合わせて 16 分の空白まで吸収できる)
+    parser.add_argument("--late-tolerance", type=float, default=9, help="通知のタイミングを何分過ぎていても送るか")
     parser.add_argument("--race-id", help="時刻に関係なく, このレースを今のオッズで予測する (動作確認用)")
     parser.add_argument("--now", help="現在時刻を上書きする (動作確認用. 例: '2026-11-22 14:30'. 待機もしない)")
     parser.add_argument("--no-wait", action="store_true", help="通知のタイミングまで待たずにすぐ処理する (動作確認用)")

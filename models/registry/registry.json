@@ -200,6 +200,26 @@
         "top3_precision": 0.4506172839506172,
         "wide_top_pair_hit": 0.2037037037037037
       }
+    },
+    "v011": {
+      "registered_at": "2026-11-23 11:14:14",
+      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_111402)",
+      "train_period": [
+        "2023-11-25",
+        "2026-11-22"
+      ],
+      "n_train_races": 789,
+      "test_period": [
+        "2026-05-17",
+        "2026-11-22"
+      ],
+      "test_metrics": {
+        "roc_auc_by_race": 0.718077927197424,
+        "roc_auc": 0.7361150310400296,
+        "logloss": 0.4536130307940076,
+        "top3_precision": 0.4318658280922432,
+        "wide_top_pair_hit": 0.18867924528301888
+      }
     }
   },
   "history": [

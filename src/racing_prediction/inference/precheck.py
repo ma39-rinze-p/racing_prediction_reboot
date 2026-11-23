@@ -128,7 +128,7 @@ def main() -> None:
     parser.add_argument("--odds-minutes-before", default="12")
     parser.add_argument("--predict-minutes-before-max", type=float, default=50)
     parser.add_argument("--lookahead", type=float, default=7)  # run.py と揃える
-    parser.add_argument("--late-tolerance", type=float, default=3)
+    parser.add_argument("--late-tolerance", type=float, default=9)  # run.py と揃える
     parser.add_argument("--now", help="現在時刻を上書きする (動作確認用. 例: '2026-11-22 14:30')")
     args = parser.parse_args()
 
