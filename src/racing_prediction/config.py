@@ -17,10 +17,15 @@ import pandas as pd
 import yaml
 
 
+# JRA の 10 競馬場 (configs/train.yaml の data.venues に書ける名前)
+JRA_VENUES = ("札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉")
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     start_date: pd.Timestamp | None
     end_date: pd.Timestamp | None
+    venues: tuple[str, ...] | None  # 学習・テストに使う競馬場. None なら data/processed/races にある全競馬場
     test_ratio: float
     n_trials: int
     timeout_sec: int | None
@@ -31,6 +36,7 @@ class TrainConfig:
         d = asdict(self)
         for key in ("start_date", "end_date"):
             d[key] = None if d[key] is None else str(d[key].date())
+        d["venues"] = None if self.venues is None else list(self.venues)
         return d
 
 
@@ -80,6 +86,15 @@ def _date(value, name: str) -> pd.Timestamp | None:
         raise ValueError(f"{name} を日付として読めません: {value!r} (例: \"2025-11-23\")") from e
 
 
+def _venues(value) -> tuple[str, ...] | None:
+    """data.venues: null / "東京" / "東京,京都" / [東京, 京都] -> 競馬場名のタプル (空なら None = 全競馬場)."""
+    if value is None:
+        return None
+    items = value.split(",") if isinstance(value, str) else list(value)
+    names = tuple(dict.fromkeys(str(v).strip() for v in items if str(v).strip()))
+    return names or None
+
+
 def load_train_config(path: str | Path) -> TrainConfig:
     """YAML を読み込み, 値をチェックして TrainConfig を返す."""
     path = Path(path)
@@ -91,6 +106,7 @@ def load_train_config(path: str | Path) -> TrainConfig:
     cfg = TrainConfig(
         start_date=_date(data.get("start_date"), "data.start_date"),
         end_date=_date(data.get("end_date"), "data.end_date"),
+        venues=_venues(data.get("venues")),
         test_ratio=float(split.get("test_ratio", 0.2)),
         n_trials=int(tuning.get("n_trials", 100)),
         timeout_sec=None if tuning.get("timeout_sec") is None else int(tuning["timeout_sec"]),
@@ -100,6 +116,9 @@ def load_train_config(path: str | Path) -> TrainConfig:
     errors = []
     if cfg.start_date is not None and cfg.end_date is not None and cfg.start_date > cfg.end_date:
         errors.append(f"data.start_date ({cfg.start_date.date()}) が data.end_date ({cfg.end_date.date()}) より後です")
+    unknown = [v for v in (cfg.venues or ()) if v not in JRA_VENUES]
+    if unknown:
+        errors.append(f"data.venues に未対応の競馬場があります: {unknown} (書けるのは {list(JRA_VENUES)})")
     if not 0 < cfg.test_ratio < 1:
         errors.append(f"split.test_ratio は 0 より大きく 1 より小さい値にしてください: {cfg.test_ratio}")
     if cfg.n_trials < 1:

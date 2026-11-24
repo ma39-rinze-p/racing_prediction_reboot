@@ -7,18 +7,21 @@
 
 アクセスは scrape_shutuba.polite_get を経由するため,
 User-Agent の付与とアクセスごとの 1〜3 秒ランダム待機が必ず行われる.
+
+血統は変わらないため, 取得した血統は data/raw/horse_pedigree/{horse_id}.json に保存し,
+次からは (別の実行・別のレースでも) アクセスせずに使う (racing_prediction.data.cache).
 """
 
 from __future__ import annotations
 
 import re
 import warnings
-from functools import lru_cache
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup, Tag
 
+from racing_prediction.data.cache import cache_dir, read_json, write_json
 from racing_prediction.data.scrape_shutuba import polite_get
 
 HORSE_PED_URL = "https://db.netkeiba.com/horse/ped/{horse_id}/"
@@ -73,18 +76,29 @@ def parse_horse_pedigree_html(html: str) -> dict:
     return pedigree
 
 
+_memory: dict[str, dict] = {}  # 実行中に取得・読み込みした血統
+
+
 def fetch_horse_pedigree(horse_id: str) -> dict:
     """horse_id を指定して血統ページを取得し, 2 代までの血統を dict で返す.
 
-    血統は変わらないため, 実行中 (カーネル起動中) は同じ馬には 1 回だけアクセスする.
+    血統は変わらないため, 実行中に取得済み, またはディスクに保存済みならアクセスしない.
+    血統表が読めなかった (父が取れなかった) 場合は保存せず, 次回また取得する.
     """
-    return dict(_fetch_horse_pedigree_cached(horse_id))
+    if horse_id in _memory:
+        return dict(_memory[horse_id])
+    path = cache_dir("horse_pedigree") / f"{horse_id}.json"
+    saved = read_json(path)
+    if isinstance(saved, dict) and all(c in saved for c in PEDIGREE_COLUMNS):
+        _memory[horse_id] = saved
+        return dict(saved)
 
-
-@lru_cache(maxsize=None)
-def _fetch_horse_pedigree_cached(horse_id: str) -> dict:
     response = polite_get(HORSE_PED_URL.format(horse_id=horse_id))
-    return parse_horse_pedigree_html(response.text)
+    pedigree = parse_horse_pedigree_html(response.text)
+    _memory[horse_id] = pedigree
+    if pedigree.get("sire"):
+        write_json(path, pedigree)
+    return dict(pedigree)
 
 
 def add_pedigree(df_horses: pd.DataFrame) -> pd.DataFrame:

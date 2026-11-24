@@ -71,6 +71,17 @@ def filter_period(
     return out
 
 
+def filter_venues(df: pd.DataFrame, venues: list[str] | tuple[str, ...] | None = None) -> pd.DataFrame:
+    """競馬場 (race_venue) が venues のどれかのレースだけに絞る. None や空なら全競馬場を使う."""
+    if not venues:
+        return df.reset_index(drop=True)
+    out = df[df["race_venue"].isin(list(venues))].reset_index(drop=True)
+    if out.empty:
+        found = sorted(df["race_venue"].dropna().unique())
+        raise ValueError(f"競馬場 {list(venues)} のレースがありません (データにある競馬場: {found})")
+    return out
+
+
 def time_split(df: pd.DataFrame, test_ratio: float = 0.2) -> tuple[pd.DataFrame, pd.DataFrame]:
     """開催日の新しい方から, 全開催日数の test_ratio の割合をテスト, 残りを学習にする.
 

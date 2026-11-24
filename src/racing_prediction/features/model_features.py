@@ -2,14 +2,23 @@
 
 data/processed/races 以下の CSV を読み込み, LightGBM に入れる特徴量行列を作る.
 
-学習データだけから決める値 (カテゴリの種類, 平均着順の事前値) は FeatureBuilder.fit で学習し,
+学習データだけから決める値 (カテゴリの種類, 平均着順の事前値, 騎手などの成績, スピード指数の基準タイム) は
+FeatureBuilder.fit で学習し,
 推論時も同じ FeatureBuilder (保存して読み込んだもの) で transform することで,
 学習と推論の前処理を一致させる.
 
 追加する特徴量:
     cur_*      : 今回のレース条件 (芝/ダート, 距離区分, 馬場状態, 競馬場) に対応する平均着順・出走回数
     shr_*      : cur_* の平均着順を, 出走回数が少ないほど全体平均に寄せた値 (少数レースのブレ対策)
-    *_race_rank: レース内での順位 (0〜1, 小さいほど上位). 他の馬との比較を表す
+    speed_*    : スピード指数. 直近 3 走の走破タイムが, コース・距離・馬場状態ごとの基準タイム
+                 (学習データの中央値) より 1000m あたり何秒速いか
+    {騎手・調教師・父・母父}_win_rate / _top3_rate / _n_runs:
+                 その騎手などの 勝率・3 着以内率・出走数 (対象レースより前の学習データのレースだけで計算).
+                 名前をそのままカテゴリ変数にすると, 種類が多すぎてモデルが丸暗記する (過学習) ため置き換えた
+    race_n_front_runners: レース内の逃げ・先行馬の頭数 (展開)
+    odds_*     : 単勝オッズ (win_odds 列). 学習では確定オッズ, 推論では推論時点 (発走 12 分前) に取得したオッズ
+                 (inference/run.py が win_odds 列を置き換える)
+    *_race_rank: レース内での順位 (0〜1, 小さいほど値が小さい). 他の馬との比較を表す
     *_race_diff: レース内平均との差
 """
 
@@ -21,25 +30,52 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from racing_prediction.data.make_dataset import TARGET_COLUMN, add_win_label, feature_columns, output_columns
-from racing_prediction.features.build_features import VENUES
+from racing_prediction.data.make_dataset import (
+    TARGET_COLUMN,
+    TOP3_COLUMN,
+    add_win_label,
+    feature_columns,
+    output_columns,
+)
+from racing_prediction.features.build_features import N_SPEED_RACES, VENUES
 
-# LightGBM のカテゴリ変数として扱う列
+# LightGBM のカテゴリ変数として扱う列 (種類が少ないものだけ)
 CATEGORICAL_COLUMNS = [
     "race_venue",
     "race_distance_category",
     "race_surface",
     "race_track_condition",
     "sex",
-    "jockey_name",
-    "trainer_name",
-    "sire",
     "sire_line",
-    "dam",
-    "sire_sire",
-    "sire_dam",
-    "dam_sire",
-    "dam_dam",
+]
+
+# 名前ごとの 勝率・3 着以内率・出走数 に置き換える列 (種類が多く, カテゴリ変数のままだと過学習するため)
+RATE_COLUMNS = ["jockey_name", "trainer_name", "sire", "dam_sire"]
+# 成績を出すにはデータが少なすぎる (1 頭ごとにほぼ違う) ため, 特徴量に使わない列
+DROPPED_COLUMNS = ["dam", "sire_sire", "sire_dam", "dam_dam"]
+# 勝率などを全体の平均に寄せる強さ (この出走数分だけ「全体平均の成績」を足したとみなす)
+RATE_SMOOTHING = 20.0
+
+# スピード指数の基準タイムを決めるのに必要な最少レース数
+SPEED_MIN_RUNS = 10
+# 直近 3 走の最初のコーナーの位置 (0 = 先頭, 1 = 最後方) がこれ未満の馬を逃げ・先行馬とみなす
+FRONT_RUNNER_RATIO = 0.25
+
+# レース内での順位・平均との差を追加する列 (shr_avg_rank_* に加えて)
+RELATIVE_COLUMNS = [
+    "weight_carried",
+    "horse_weight",
+    "age",
+    "hist_avg3_rank_ratio",
+    "hist_avg3_margin",
+    "hist_avg3_log_odds",
+    "hist_prize_365",
+    "hist_best3_agari",
+    "hist_avg3_first_corner",
+    "speed_best3",
+    "speed_avg3",
+    "jockey_name_win_rate",
+    "trainer_name_win_rate",
 ]
 
 # 学習データでの出現回数がこれ未満のカテゴリは "__other__" にまとめる
@@ -67,7 +103,7 @@ def load_race_csvs(races_dir: str | Path) -> pd.DataFrame:
     required = output_columns()
     tables, skipped = [], []
     for path in paths:
-        df = pd.read_csv(path, encoding="utf-8-sig", dtype={"race_id": str}, parse_dates=["race_date"])
+        df = pd.read_csv(path, encoding="utf-8-sig", dtype={"race_id": str, "horse_id": str}, parse_dates=["race_date"])
         if any(c not in df.columns for c in required):
             skipped.append(path)
             continue
@@ -76,7 +112,7 @@ def load_race_csvs(races_dir: str | Path) -> pd.DataFrame:
     if skipped:
         warnings.warn(
             f"列が足りない古い CSV を {len(skipped)} 件読み飛ばしました (例: {skipped[0]}). "
-            "collect_races を再実行すると取り直されます."
+            "python scripts/backfill_race_features.py を実行すると列が補われます."
         )
     if not tables:
         raise ValueError("読み込める CSV がありませんでした")
@@ -117,6 +153,13 @@ class FeatureBuilder:
         self.categories: dict[str, list[str]] = {}
         self.rank_prior: float | None = None
         self.feature_names: list[str] = []
+        # 騎手・調教師・父・母父ごとの成績 {列名: DataFrame[key, race_date, n, win, top3]} (開催日ごとの集計)
+        self.rate_events: dict[str, pd.DataFrame] = {}
+        self.rate_priors: dict[str, float] = {}
+        # スピード指数の基準タイム {"競馬場|芝ダ|距離": 秒}, {"芝ダ|距離": 秒}, 馬場状態の補正 {"芝ダ|馬場": 倍率}
+        self.speed_base: dict[str, float] = {}
+        self.speed_base_coarse: dict[str, float] = {}
+        self.speed_condition: dict[str, float] = {}
 
     # ---- 学習 -------------------------------------------------------------
     def fit(self, df: pd.DataFrame) -> "FeatureBuilder":
@@ -130,8 +173,40 @@ class FeatureBuilder:
         # 平均着順の事前値 = 学習データの着順の平均
         self.rank_prior = float(df["rank"].dropna().mean())
 
+        self._fit_rates(df)
+        self._fit_speed(df)
         self.feature_names = list(self._build(df.head(1)).columns)
         return self
+
+    def _fit_rates(self, df: pd.DataFrame) -> None:
+        """騎手などの名前ごとに, 開催日ごとの 出走数・1 着数・3 着以内数 を集計しておく."""
+        done = df[df[TARGET_COLUMN].notna()]
+        win = pd.to_numeric(done[TARGET_COLUMN], errors="coerce").fillna(0)
+        top3 = pd.to_numeric(done[TOP3_COLUMN], errors="coerce").fillna(0)
+        self.rate_priors = {"win": float(win.mean()), "top3": float(top3.mean())}
+        self.rate_events = {}
+        for col in RATE_COLUMNS:
+            g = pd.DataFrame({"key": done[col].astype("string"), "race_date": done["race_date"], "win": win, "top3": top3})
+            g = g.dropna(subset=["key"]).groupby(["key", "race_date"], as_index=False).agg(
+                n=("win", "size"), win=("win", "sum"), top3=("top3", "sum")
+            )
+            self.rate_events[col] = g
+
+    def _fit_speed(self, df: pd.DataFrame) -> None:
+        """学習データの各馬の直近 3 走から, コース・距離ごとの基準タイム (中央値) と馬場状態の補正を決める."""
+        runs = _past_runs(df)
+        runs = runs[runs["surface"].isin(["turf", "dirt"])]
+        fine = runs.groupby(["venue", "surface", "distance"])["time"].agg(["median", "size"])
+        fine = fine[fine["size"] >= SPEED_MIN_RUNS]
+        self.speed_base = {f"{v}|{s}|{int(d)}": float(m) for (v, s, d), m in fine["median"].items()}
+        coarse = runs.groupby(["surface", "distance"])["time"].agg(["median", "size"])
+        coarse = coarse[coarse["size"] >= SPEED_MIN_RUNS]
+        self.speed_base_coarse = {f"{s}|{int(d)}": float(m) for (s, d), m in coarse["median"].items()}
+
+        base = self._speed_base(runs)
+        ratio = (runs["time"] / base).where(base > 0)
+        cond = ratio.groupby([runs["surface"], runs["track_condition"]]).median().dropna()
+        self.speed_condition = {f"{s}|{c}": float(r) for (s, c), r in cond.items()}
 
     # ---- 変換 -------------------------------------------------------------
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -140,8 +215,72 @@ class FeatureBuilder:
             raise RuntimeError("先に fit してください")
         return self._build(df)[self.feature_names]
 
+    def _speed_base(self, runs: pd.DataFrame) -> pd.Series:
+        """各レースの基準タイム (コース・距離の中央値. 少なければ芝ダ・距離の中央値)."""
+        dist = runs["distance"].round().astype("Int64").astype("string")
+        fine = (runs["venue"].astype("string") + "|" + runs["surface"].astype("string") + "|" + dist).map(self.speed_base)
+        coarse = (runs["surface"].astype("string") + "|" + dist).map(self.speed_base_coarse)
+        return pd.to_numeric(fine, errors="coerce").fillna(pd.to_numeric(coarse, errors="coerce"))
+
+    def _speed_figures(self, df: pd.DataFrame) -> pd.DataFrame:
+        """直近 3 走のスピード指数 (基準タイムより 1000m あたり何秒速いか. 大きいほど速い)."""
+        runs = _past_runs(df, keep_missing=True)
+        base = self._speed_base(runs)
+        cond_key = runs["surface"].astype("string") + "|" + runs["track_condition"].astype("string")
+        cond = pd.to_numeric(cond_key.map(self.speed_condition), errors="coerce").fillna(1.0)
+        speed = (base * cond - runs["time"]) / runs["distance"] * 1000
+        wide = speed.to_numpy().reshape(N_SPEED_RACES, len(df)).T  # 行 = 馬, 列 = 前走, 2 走前, 3 走前
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)  # 全部欠損の行の nanmax / nanmean
+            return pd.DataFrame(
+                {
+                    "speed_last1": wide[:, 0],
+                    "speed_best3": np.nanmax(wide, axis=1),
+                    "speed_avg3": np.nanmean(wide, axis=1),
+                },
+                index=df.index,
+            )
+
+    def _rates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """騎手・調教師・父・母父ごとの 勝率・3 着以内率・出走数 (対象レースの開催日より前のレースだけで計算).
+
+        学習データの各行は「その日より前」の成績だけを使うので, 結果のリークにならない.
+        推論 (学習期間より後のレース) では, 学習期間全体の成績を使う.
+        少ない出走数のブレを抑えるため, 全体の平均を RATE_SMOOTHING 回分足して割る.
+        """
+        out = pd.DataFrame(index=df.index)
+        query = pd.DataFrame({"race_date": pd.to_datetime(df["race_date"]).to_numpy(), "row": np.arange(len(df))})
+        for col in RATE_COLUMNS:
+            events = self.rate_events.get(col)
+            n = np.zeros(len(df))
+            win = np.zeros(len(df))
+            top3 = np.zeros(len(df))
+            if events is not None and len(events):
+                ev = events.sort_values(["key", "race_date"]).copy()
+                for c in ("n", "win", "top3"):
+                    ev[c] = ev.groupby("key")[c].cumsum()
+                # merge_asof は キー・日付の型が完全に一致している必要がある
+                ev["key"] = ev["key"].astype(str).astype(object)
+                ev["race_date"] = pd.to_datetime(ev["race_date"]).astype("datetime64[ns]")
+                keys = df[col].astype("string").to_numpy()
+                q = query.assign(key=keys).dropna(subset=["key"])
+                q["key"] = q["key"].astype(str).astype(object)
+                q["race_date"] = q["race_date"].astype("datetime64[ns]")
+                merged = pd.merge_asof(
+                    q.sort_values("race_date"), ev.sort_values("race_date"), on="race_date", by="key",
+                    allow_exact_matches=False,  # 同じ日のレースの結果は使わない
+                ).dropna(subset=["n"])
+                rows = merged["row"].to_numpy(dtype=int)
+                n[rows], win[rows], top3[rows] = merged["n"], merged["win"], merged["top3"]
+            m = RATE_SMOOTHING
+            out[f"{col}_n_runs"] = n
+            out[f"{col}_win_rate"] = (win + m * self.rate_priors.get("win", 0.0)) / (n + m)
+            out[f"{col}_top3_rate"] = (top3 + m * self.rate_priors.get("top3", 0.0)) / (n + m)
+        return out
+
     def _build(self, df: pd.DataFrame) -> pd.DataFrame:
-        base_cols = [c for c in feature_columns() if c not in CATEGORICAL_COLUMNS]
+        excluded = set(CATEGORICAL_COLUMNS) | set(RATE_COLUMNS) | set(DROPPED_COLUMNS)
+        base_cols = [c for c in feature_columns() if c not in excluded]
         X = df[base_cols].apply(pd.to_numeric, errors="coerce").astype(float)
 
         # 今回のレース条件に対応する平均着順・出走回数 (+ 全体平均に寄せた値)
@@ -155,18 +294,20 @@ class FeatureBuilder:
                 np.nan_to_num(avg, nan=0.0) * n0 + self.rank_prior * SHRINK_STRENGTH
             ) / (n0 + SHRINK_STRENGTH)
 
+        # スピード指数, 騎手などの成績, 単勝オッズ
+        X = pd.concat([X, self._speed_figures(df), self._rates(df), _odds_features(df)], axis=1)
+        X["odds_log_minus_hist"] = X["odds_log"] - X["hist_avg3_log_odds"]  # 近走より人気になっているか (マイナスなら人気上昇)
+
+        # 展開: レース内の逃げ・先行馬 (直近 3 走の最初のコーナーの位置が前の方) の頭数
+        front = (X["hist_avg3_first_corner"] < FRONT_RUNNER_RATIO).astype(float)
+        X["race_n_front_runners"] = front.groupby(df["race_id"].to_numpy()).transform("sum").to_numpy()
+
         # 他の馬との比較: レース内での順位と, レース内平均との差
-        relative_cols = [f"shr_avg_rank_{k}" for k in _CONDITION_KINDS] + [
-            "weight_carried",
-            "horse_weight",
-            "age",
-        ]
+        relative_cols = [f"shr_avg_rank_{k}" for k in _CONDITION_KINDS] + RELATIVE_COLUMNS
         groups = X[relative_cols].groupby(df["race_id"].to_numpy())
         ranks = groups.rank(method="average", pct=True)
         diffs = X[relative_cols] - groups.transform("mean")
-        for col in relative_cols:
-            X[f"{col}_race_rank"] = ranks[col]
-            X[f"{col}_race_diff"] = diffs[col]
+        X = pd.concat([X, ranks.add_suffix("_race_rank"), diffs.add_suffix("_race_diff")], axis=1)
 
         # カテゴリ変数 (学習時に決めた種類に揃える. 学習時に少なかった・未知のものは "__other__")
         for col in CATEGORICAL_COLUMNS:
@@ -179,11 +320,26 @@ class FeatureBuilder:
 
     # ---- 保存・読み込み -------------------------------------------------------
     def to_dict(self) -> dict:
+        """保存用の dict. 騎手などの成績は, 学習期間全体の合計だけを保存する
+        (推論は学習期間より後のレースなので, 合計だけで同じ結果になる)."""
+        rate_totals, as_of = {}, None
+        for col, ev in self.rate_events.items():
+            totals = ev.groupby("key")[["n", "win", "top3"]].sum()
+            rate_totals[col] = {k: [int(r.n), float(r.win), float(r.top3)] for k, r in totals.iterrows()}
+            if len(ev):
+                last = pd.Timestamp(ev["race_date"].max())
+                as_of = last if as_of is None else max(as_of, last)
         return {
             "min_category_count": self.min_category_count,
             "categories": self.categories,
             "rank_prior": self.rank_prior,
             "feature_names": self.feature_names,
+            "rate_priors": self.rate_priors,
+            "rate_as_of": str(as_of.date()) if as_of is not None else None,
+            "rate_totals": rate_totals,
+            "speed_base": self.speed_base,
+            "speed_base_coarse": self.speed_base_coarse,
+            "speed_condition": self.speed_condition,
         }
 
     @classmethod
@@ -192,7 +348,67 @@ class FeatureBuilder:
         builder.categories = d["categories"]
         builder.rank_prior = d["rank_prior"]
         builder.feature_names = d["feature_names"]
+        builder.rate_priors = d.get("rate_priors", {})
+        # 合計は「学習期間の最終日」の 1 回分の成績として持つ (それより後のレースにだけ使われる)
+        as_of = pd.Timestamp(d["rate_as_of"]) if d.get("rate_as_of") else None
+        builder.rate_events = {
+            col: pd.DataFrame(
+                [(k, as_of, n, w, t) for k, (n, w, t) in totals.items()],
+                columns=["key", "race_date", "n", "win", "top3"],
+            )
+            for col, totals in d.get("rate_totals", {}).items()
+            if as_of is not None
+        }
+        builder.speed_base = d.get("speed_base", {})
+        builder.speed_base_coarse = d.get("speed_base_coarse", {})
+        builder.speed_condition = d.get("speed_condition", {})
         return builder
+
+
+def _odds_features(df: pd.DataFrame) -> pd.DataFrame:
+    """単勝オッズの特徴量.
+
+    odds_log : 単勝オッズの対数
+    odds_prob: 1 / オッズ をレース内の合計が 1 になるよう揃えた値 (市場が見積もる 1 着の確率. 控除率の分は取り除かれる)
+    odds_rank: レース内のオッズの順位 (1 = 1 番人気). 人気 (popularity) 列は使わず, オッズから計算する
+               (推論時に取得するオッズと確実に揃えるため)
+    オッズがない馬 (取消など) は欠損.
+    """
+    odds = pd.to_numeric(df["win_odds"], errors="coerce").where(lambda o: o > 0)
+    race = df["race_id"].to_numpy()
+    inv = 1.0 / odds
+    return pd.DataFrame(
+        {
+            "odds_log": np.log(odds),
+            "odds_prob": inv / inv.groupby(race).transform("sum"),
+            "odds_rank": odds.groupby(race).rank(method="min"),
+        },
+        index=df.index,
+    )
+
+
+def _past_runs(df: pd.DataFrame, keep_missing: bool = False) -> pd.DataFrame:
+    """各馬の直近 3 走 (hist_last{k}_*) を縦に並べる (前走の全馬, 2 走前の全馬, 3 走前の全馬 の順).
+
+    keep_missing=False なら, タイム・距離がない行を除く.
+    """
+    parts = []
+    for k in range(1, N_SPEED_RACES + 1):
+        part = pd.DataFrame(
+            {
+                "time": pd.to_numeric(df[f"hist_last{k}_time"], errors="coerce").to_numpy(),
+                "distance": pd.to_numeric(df[f"hist_last{k}_distance"], errors="coerce").to_numpy(),
+                "surface": df[f"hist_last{k}_surface"].astype("string").to_numpy(),
+                "venue": df[f"hist_last{k}_venue"].astype("string").to_numpy(),
+                "track_condition": df[f"hist_last{k}_track_condition"].astype("string").to_numpy(),
+            }
+        )
+        parts.append(part)
+    runs = pd.concat(parts, ignore_index=True)
+    if not keep_missing:
+        runs = runs.dropna(subset=["time", "distance"])
+        runs = runs[runs["distance"] > 0]
+    return runs
 
 
 def labeled(df: pd.DataFrame) -> pd.DataFrame:

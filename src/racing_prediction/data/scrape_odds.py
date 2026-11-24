@@ -1,4 +1,4 @@
-"""netkeiba からワイドのオッズを取得する.
+"""netkeiba からワイド・単勝のオッズを取得する.
 
 出馬表の HTML にはオッズが入っておらず, ページを開いた後に JavaScript で次の API から読み込まれる.
     https://race.netkeiba.com/api/api_get_jra_odds.html?race_id=...&type=5&action=init
@@ -75,3 +75,48 @@ def fetch_wide_odds(race_id: str) -> WideOdds:
     """race_id のワイドのオッズを取得する (推論の時点で発売中のオッズ)."""
     response = polite_get(ODDS_API_URL, params={"race_id": race_id, "type": WIDE_TYPE, "action": "init"})
     return parse_wide_odds_json(response.text)
+
+
+# ---------------------------------------------------------------------------
+# 単勝オッズ (モデルの特徴量に使う)
+# ---------------------------------------------------------------------------
+WIN_TYPE = "1"
+WIN_ODDS_COLUMNS = ["umaban", "win_odds", "popularity"]
+# 推論に使えるオッズの状態. "yoso" は発売前の予想オッズ (実際の馬券のオッズではない)
+LIVE_ODDS_STATUSES = ("middle", "result")
+
+
+@dataclass
+class WinOdds:
+    odds: pd.DataFrame  # umaban, win_odds, popularity
+    status: str  # "middle" (発売中) / "result" (確定) / "yoso" (発売前の予想オッズ) など
+    official_datetime: str | None  # オッズの更新時刻
+
+
+def parse_win_odds_json(text: str) -> WinOdds:
+    """オッズ API のレスポンスから単勝オッズを取り出す. オッズがなければ空の DataFrame.
+
+    レスポンスの例: {"status": "middle", "data": {"official_datetime": "...",
+                     "odds": {"1": {"12": ["2.4", "", "1"], ...}}}}   "12" = 馬番, ["オッズ", "", "人気"]
+    取消・除外の馬はオッズが 0 や "---" になるので除く.
+    """
+    payload = json.loads(text)
+    data = payload.get("data") or {}
+    raw = ((data.get("odds") or {}).get(WIN_TYPE)) or {}
+    rows = []
+    for key, values in raw.items():
+        if not str(key).isdigit() or not isinstance(values, list) or not values:
+            continue
+        odds = _to_float(values[0])
+        if odds is None:
+            continue
+        popularity = values[2] if len(values) > 2 else None
+        rows.append({"umaban": int(key), "win_odds": odds, "popularity": int(popularity) if str(popularity).isdigit() else None})
+    df = pd.DataFrame(rows, columns=WIN_ODDS_COLUMNS).sort_values("umaban", ignore_index=True)
+    return WinOdds(odds=df, status=str(payload.get("status", "")), official_datetime=data.get("official_datetime"))
+
+
+def fetch_win_odds(race_id: str) -> WinOdds:
+    """race_id の単勝オッズを取得する (推論の時点で発売中のオッズ)."""
+    response = polite_get(ODDS_API_URL, params={"race_id": race_id, "type": WIN_TYPE, "action": "init"})
+    return parse_win_odds_json(response.text)

@@ -1,8 +1,11 @@
 """発走 12 分前に推論を始め, その時点のオッズで期待値を計算して通知する. GitHub Actions で開催日に常駐して実行する.
 
 「発走 12 分前」(--odds-minutes-before で変更可. カンマ区切りで複数も可) になったら推論を始め
-(出馬表・馬体重・戦績・血統を取得して予測. 1 レース 1〜2 分), 続けてその時点のワイドのオッズで
-期待値プラスのワイド ボックスを計算し, メールを送る (1 レースにつき 1 通).
+(出馬表・馬体重・戦績・血統と, その時点の単勝オッズを取得して予測. 1 レース 1〜2 分), 続けてその時点の
+ワイドのオッズで期待値プラスのワイド ボックスを計算し, メールを送る (1 レースにつき 1 通).
+
+単勝オッズはモデルの特徴量なので, 推論のたびにその時点のオッズを取得する. 発売中 (または確定) のオッズが
+取れなければ推論を失敗扱いにして再試行する (--race-id の手動実行だけは, 発売前の予想オッズでも予測する).
 
 1 回の実行でやること:
     1. その日の時刻表を取得 (初回のみ. 以降は状態ファイルに保存したものを使う)
@@ -17,6 +20,7 @@
     python -m racing_prediction.inference.run                      # 通常 (今の時刻で判定)
     python -m racing_prediction.inference.run --dry-run --no-wait  # 通知せず・待たずに本文を表示
     python -m racing_prediction.inference.run --race-id 202605050611 --dry-run   # 時刻に関係なく今のオッズで予測
+                                                                   # (発売前なら予想オッズで予測する)
     python -m racing_prediction.inference.run --venues 東京,京都 --race-numbers 7-12 --odds-minutes-before 12
     python -m racing_prediction.inference.run --prepare-only       # 時刻表を取得して, 対象レースがある日かだけ判定する
                                                                    # (GITHUB_OUTPUT に race_day=true/false を書く)
@@ -42,7 +46,7 @@ from racing_prediction.betting.optimize_bet import add_box_hit_rates, all_box_ex
 from racing_prediction.config import BettingConfig, load_betting_config
 from racing_prediction.data.make_dataset import build_race_table
 from racing_prediction.data.race_list import fetch_race_schedule, venue_code
-from racing_prediction.data.scrape_odds import fetch_wide_odds
+from racing_prediction.data.scrape_odds import LIVE_ODDS_STATUSES, fetch_wide_odds, fetch_win_odds
 from racing_prediction.inference.notify import notify
 from racing_prediction.inference.report import format_race_report
 from racing_prediction.models.predict_model import load_artifacts, predict_win, simulate_top3, wide_probabilities
@@ -55,8 +59,14 @@ DEFAULT_BETTING_CONFIG = "configs/betting.yaml"
 # 状態ファイルに保存する予測結果の列 (メールの作成に使う)
 PRED_COLUMNS = [
     "race_id", "race_date", "race_venue", "race_surface", "race_track_condition", "n_horses",
-    "umaban", "horse_name", "p_win", "pred_rank", "horse_weight", "weight_diff",
+    "umaban", "horse_name", "p_win", "pred_rank", "horse_weight", "weight_diff", "win_odds", "popularity",
 ]
+
+ODDS_STATUS_JA = {"middle": "発売中", "result": "確定", "yoso": "発売前の予想オッズ"}
+
+
+class OddsNotAvailable(RuntimeError):
+    """推論に使える単勝オッズがまだない (発売前など)."""
 
 
 def now_jst() -> pd.Timestamp:
@@ -191,12 +201,41 @@ def complete_race_info(race_info: dict, table: pd.DataFrame) -> dict:
     return race_info
 
 
-def predict_race(race_info: dict, booster, builder) -> tuple[dict, pd.DataFrame]:
-    """1 レースの出馬表・戦績・血統を取得して予測する. (補ったレース情報, 予測結果) を返す."""
-    table = build_race_table(race_info["race_id"])
+def apply_live_win_odds(table: pd.DataFrame, race_id: str, allow_preliminary: bool = False) -> tuple[pd.DataFrame, dict]:
+    """今の単勝オッズを取得して, 出馬表の win_odds・popularity 列を置き換える. (置き換えた表, オッズの情報) を返す.
+
+    発売中・確定のオッズが取れなければ OddsNotAvailable を出す
+    (allow_preliminary=True なら, 発売前の予想オッズ (status="yoso") でも使う).
+    オッズがない馬 (取消など) は欠損になる.
+    """
+    odds = fetch_win_odds(race_id)
+    ok = odds.status in LIVE_ODDS_STATUSES or (allow_preliminary and odds.status == "yoso")
+    if odds.odds.empty or not ok:
+        raise OddsNotAvailable(f"{race_id}: 推論に使える単勝オッズがありません (状態: {odds.status or '不明'}, {len(odds.odds)} 頭分)")
+    table = table.drop(columns=["win_odds", "popularity"], errors="ignore").merge(odds.odds, on="umaban", how="left")
+    missing = table.loc[table["win_odds"].isna(), "umaban"].tolist()
+    if missing:
+        print(f"{race_id}: 単勝オッズがない馬番 {missing} (取消などの可能性)")
+    status = ODDS_STATUS_JA.get(odds.status, odds.status or "状態不明")
+    info = {"win_odds_status": odds.status, "win_odds_note": f"{odds.official_datetime or '時刻不明'} 時点 ({status})"}
+    return table, info
+
+
+def predict_race(
+    race_info: dict, booster, builder, table: pd.DataFrame | None = None, allow_preliminary: bool = False
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """1 レースを予測する. (補ったレース情報, 予測結果, 出馬表) を返す.
+
+    table (取得済みの出馬表・戦績・血統) がなければ取得する. 単勝オッズはモデルの特徴量なので, 毎回その時点の
+    オッズを取得して使う.
+    """
+    if table is None:
+        table = build_race_table(race_info["race_id"])
     race_info = complete_race_info(race_info, table)
-    pred = predict_win(table, booster, builder).reset_index(drop=True)
-    return race_info, pred
+    with_odds, odds_info = apply_live_win_odds(table, race_info["race_id"], allow_preliminary=allow_preliminary)
+    print(f"{race_info['race_id']}: 単勝オッズ {odds_info['win_odds_note']} で予測します")
+    pred = predict_win(with_odds, booster, builder).reset_index(drop=True)
+    return {**race_info, **odds_info}, pred, table
 
 
 def model_version_label(model_dir: str | Path) -> str:
@@ -333,13 +372,19 @@ def main(argv: list[str] | None = None) -> int:
             model.update(booster=booster, builder=builder)
         return model["booster"], model["builder"]
 
-    def ensure_prediction(race_info: dict, fresh: bool = False) -> tuple[dict, pd.DataFrame]:
-        """予測済みならそれを使い (fresh=True なら予測し直す), なければ予測して状態ファイルに保存する."""
-        saved = state["predictions"].get(race_info["race_id"])
-        if saved and not fresh:
-            return {**race_info, **saved["race_info"]}, pred_from_state(saved["pred"])
-        print(f"{race_info['race_id']}: 予測しています...")
-        info, pred = predict_race(race_info, *get_model())
+    tables: dict[str, pd.DataFrame] = {}  # 取得済みの出馬表・戦績・血統 (同じ実行の中で使い回す)
+
+    def ensure_prediction(race_info: dict, fresh: bool = False, allow_preliminary: bool = False) -> tuple[dict, pd.DataFrame]:
+        """今の単勝オッズで予測し, 状態ファイルに保存する.
+
+        単勝オッズはモデルの特徴量なので, 予測は毎回やり直す. 出馬表・戦績・血統は, 同じ実行の中で取得済みなら
+        使い回す (fresh=True なら取り直す. 馬体重・出走取消などを反映するため).
+        """
+        race_id = race_info["race_id"]
+        table = None if fresh else tables.get(race_id)
+        print(f"{race_id}: 予測しています" + ("..." if table is None else " (取得済みの出馬表を使い, オッズだけ取り直します)..."))
+        info, pred, table = predict_race(race_info, *get_model(), table=table, allow_preliminary=allow_preliminary)
+        tables[race_id] = table
         state["predictions"][race_info["race_id"]] = {
             "race_info": {k: (str(v) if k == "start_time" else v) for k, v in info.items()},
             "pred": pred_to_state(pred),
@@ -354,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
             "race_id": args.race_id, "venue": "", "race_number": int(args.race_id[10:12]),
             "race_name": "", "course": "", "start_time": now,
         }
-        info, pred = ensure_prediction(race_info)
+        info, pred = ensure_prediction(race_info, fresh=True, allow_preliminary=True)
         send(*build_report(info, pred, betting, label="手動実行", model_version=model_version_label(args.model_dir)), args.dry_run)
         return 0
 
@@ -394,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         key = (race_id, m)
         attempts[key] = attempts.get(key, 0) + 1
         try:
-            # 最初のタイミング (発走 12 分前) では必ずその時点で推論し直す (馬体重・出走取消などを反映)
+            # その時点の単勝オッズで推論する. 最初のタイミング (発走 12 分前) では出馬表も取り直す (馬体重・出走取消などを反映)
             info, pred = ensure_prediction(race, fresh=(m == odds_minutes[0]))
             send(*build_report(info, pred, betting, label=f"発走{m}分前", model_version=model_version_label(args.model_dir)), args.dry_run)
             sent_local.setdefault(race_id, []).append(m)

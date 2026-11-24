@@ -15,6 +15,7 @@ from __future__ import annotations
 import random
 import re
 import time
+import unicodedata
 
 import pandas as pd
 import requests
@@ -141,16 +142,49 @@ def parse_shutuba_html(html: str) -> pd.DataFrame:
 
 
 _SURFACE_MAP = {"芝": "turf", "ダ": "dirt", "障": "steeple"}
+
+# レースのクラス (数値が大きいほど上のクラス). 過去戦績のレース名と出馬表のクラス欄の両方に使う
+CLASS_LEVELS = {"maiden": 0, "1win": 1, "2win": 2, "3win": 3, "open": 4, "g3": 5, "g2": 6, "g1": 7}
+_CLASS_PATTERNS = [  # 上から順に調べる (G1 を OP より先に判定するため)
+    (r"\((?:G|Jpn)(?:1|I)\)", "g1"),
+    (r"\((?:G|Jpn)(?:2|II)\)", "g2"),
+    (r"\((?:G|Jpn)(?:3|III)\)", "g3"),
+    (r"\((?:L|OP)\)|オープン", "open"),
+    (r"3勝クラス|1600万", "3win"),
+    (r"2勝クラス|1000万", "2win"),
+    (r"1勝クラス|500万", "1win"),
+    (r"新馬|未勝利", "maiden"),
+]
+# 出馬表のレース名に付くグレードのアイコン (Icon_GradeType1 = G1 など)
+_GRADE_ICON_CLASSES = {"Icon_GradeType1": "g1", "Icon_GradeType2": "g2", "Icon_GradeType3": "g3", "Icon_GradeType15": "open"}
+
+
+def race_class_level(text: str | None) -> int | None:
+    """レース名・クラス欄の文字列からクラスを数値にする (CLASS_LEVELS). 判定できなければ None (地方・海外など).
+
+    >>> race_class_level("ドンカスターC(3勝クラス)")
+    3
+    >>> race_class_level("天皇賞(秋)(G1)")
+    7
+    """
+    if not text:
+        return None
+    text = unicodedata.normalize("NFKC", text)  # 全角数字 (３勝クラス) を半角に
+    for pattern, name in _CLASS_PATTERNS:
+        if re.search(pattern, text):
+            return CLASS_LEVELS[name]
+    return None
 # 馬場状態 (過去戦績の track_condition と同じ表記に揃える)
 _TRACK_CONDITION_MAP = {"良": "good", "稍": "yielding", "重": "soft", "不": "heavy"}
 
 
 def _parse_race_info(soup: BeautifulSoup) -> dict:
-    """レース名の下の情報欄から 競馬場・芝/ダート・距離 を取り出す.
+    """レース名の下の情報欄から 競馬場・芝/ダート・距離・馬場状態・クラス・本賞金 を取り出す.
 
     RaceData01: "13:10発走 / ダ2100m 左 / 晴 / 良 ..."
         馬場状態は 芝なら span.Item03, ダートなら span.Item04 (当日の発表前は存在しない)
-    RaceData02: "5回 東京 5日目 ..." (2 番目の span が競馬場)
+    RaceData02: "5回 東京 5日目 サラ系３歳以上 ３勝クラス ... 本賞金:1870,750,... 万円" (2 番目の span が競馬場)
+    レース名 (h1.RaceName) のアイコン: グレード (G1〜G3, L)
     """
     data01 = _text(soup.select_one("div.RaceData01"))
     m = re.search(r"(芝|ダ|障)(\d+)m", data01)
@@ -161,12 +195,26 @@ def _parse_race_info(soup: BeautifulSoup) -> dict:
     if condition_span is None:  # 障害レースなどはどちらか載っている方を使う
         condition_span = soup.select_one("div.RaceData01 span.Item03, div.RaceData01 span.Item04")
     condition = _text(condition_span)
+
+    # クラス: グレードのアイコン (G1〜G3, L) があればそれ, なければクラス欄 ("３勝クラス", "オープン" など)
+    race_class = None
+    for icon in soup.select("h1.RaceName span"):
+        name = next((v for c, v in _GRADE_ICON_CLASSES.items() if c in icon.get("class", [])), None)
+        if name and (race_class is None or CLASS_LEVELS[name] > race_class):
+            race_class = CLASS_LEVELS[name]
+    data02 = " ".join(_text(s) for s in spans)
+    if race_class is None:
+        race_class = race_class_level(data02)
+    # 1 着の本賞金 (万円). "本賞金:1870,750,470,280,187万円" -> 1870
+    prize = re.search(r"本賞金:?([\d.]+)", unicodedata.normalize("NFKC", data02))
     return {
         "race_venue": _text(spans[1]) if len(spans) > 1 else None,
         "race_surface": surface,
         "race_distance": int(m.group(2)) if m else None,
         # 当日の馬場状態: "good"(良) / "yielding"(稍重) / "soft"(重) / "heavy"(不良) / None(発表前)
         "race_track_condition": _TRACK_CONDITION_MAP.get(condition[:1]),
+        "race_class": race_class,  # CLASS_LEVELS の数値 (0: 新馬・未勝利 〜 7: G1). 判定できなければ None
+        "race_prize": float(prize.group(1)) if prize else None,  # 1 着の本賞金 (万円)
     }
 
 
