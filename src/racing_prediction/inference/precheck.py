@@ -1,22 +1,19 @@
-"""推論を実行する必要があるかを, 状態ファイルだけで素早く判定する (標準ライブラリのみ・ネットアクセスなし).
+"""今日これから送る通知が残っているかを, 状態ファイルだけで素早く判定する (標準ライブラリのみ・ネットアクセスなし).
 
-GitHub Actions は開催日に 5 分おきに起動するため, 「今は予測も通知もない」時間帯は
-重いライブラリ (pandas, lightgbm など) をインストールする前に終わらせる.
-判定の条件は run.py と揃えること.
+race-inference ワークフローは, 通知が残っているときだけ重いライブラリ (pandas, lightgbm など) を
+インストールして常駐する. 判定の条件は run.pending_notifications と揃えること.
 
 判定:
-    - 今日の状態ファイルがない (今日の初回) → 実行する (時刻表の取得が必要)
-    - 今日の時刻表が空 (非開催日) → 実行しない
-    - 発走 50〜(最初の通知タイミング + 2) 分前で, まだ予測していない対象レースがある → 実行する (予測)
-    - 今から lookahead 分以内に, まだ送っていない通知のタイミング (発走 12 分前) がある → 実行する (通知)
-    - それ以外 → 実行しない
+    - 今日の状態ファイルがない (今日の初回) → 残っている (時刻表の取得が必要なので実行する)
+    - 今日の時刻表が空 (非開催日) → 残っていない
+    - 発走 (min_minutes_before_start 分前) より前で, まだ送っていない通知がある対象レースがある → 残っている
+    - それ以外 → 残っていない
 
-結果は GITHUB_OUTPUT に run=true / run=false で書き出す (なければ標準出力に表示).
-あわせて, 今日これから送る通知が残っているかを remaining=true / remaining=false で書き出す.
-remaining=false なら, その日はもう起動する必要がない (ワークフローを無効にして無料枠を節約する).
+結果は GITHUB_OUTPUT に run=true / run=false と remaining=true / remaining=false で書き出す (両者は同じ値).
+remaining=false なら, その日はもう起動する必要がない (ワークフローを無効にする).
 
 使い方:
-    python src/racing_prediction/inference/precheck.py --state-file .inference_state/state.json \\
+    python src/racing_prediction/inference/precheck.py --state-file .inference_state/state.json \
         --venues 東京 --race-numbers 7-12 --odds-minutes-before 12
 """
 
@@ -67,88 +64,52 @@ def _targets(state: dict, venues: list[str], race_numbers: set[int]) -> list[dic
     ]
 
 
-def _unsent_notifications(state: dict, race: dict, odds_minutes: list[int]) -> list[tuple[int, datetime]]:
-    """まだ送っていない通知の (発走何分前, 通知する時刻)."""
-    start = datetime.fromisoformat(race["start_time"])
-    sent = state.get("sent", {}).get(race["race_id"], [])
-    return [(m, start - timedelta(minutes=m)) for m in odds_minutes if m not in sent]
-
-
-def should_run(
-    state_file: Path,
-    now: datetime,
-    venues: list[str],
-    race_numbers: set[int],
-    odds_minutes: list[int],
-    predict_minutes_before_max: float,
-    lookahead: float,
-    late_tolerance: float,
+def next_notification(
+    state_file: Path, now: datetime, venues: list[str], race_numbers: set[int], odds_minutes: list[int],
+    min_minutes_before_start: float,
 ) -> tuple[bool, str]:
-    """(実行するか, 理由) を返す."""
+    """(今日これから送る通知が残っているか, 理由) を返す."""
     state = _load_today(state_file, now)
     if state is None:
         return True, "今日の時刻表をまだ取得していない"
     if not state["schedule"]:
         return False, "今日は開催がない"
-
-    predicted = state.get("predictions", {})
+    pending = []
     for race in _targets(state, venues, race_numbers):
         start = datetime.fromisoformat(race["start_time"])
-        if start <= now:
+        if start - timedelta(minutes=min_minutes_before_start) <= now:
             continue
-        minutes_to_start = (start - now) / timedelta(minutes=1)
-        if race["race_id"] not in predicted and max(odds_minutes) + 2 <= minutes_to_start <= predict_minutes_before_max:
-            return True, f"予測するレースがある ({race['race_id']})"
-        for m, at in _unsent_notifications(state, race, odds_minutes):
-            if now - timedelta(minutes=late_tolerance) <= at <= now + timedelta(minutes=lookahead):
-                return True, f"通知のタイミングが近い ({race['race_id']} 発走{m}分前 {at:%H:%M})"
-    return False, "今は予測も通知もない"
-
-
-def has_remaining(
-    state_file: Path, now: datetime, venues: list[str], race_numbers: set[int], odds_minutes: list[int], late_tolerance: float
-) -> bool:
-    """今日これから送る通知が残っているか. 時刻表が未取得なら (わからないので) True."""
-    state = _load_today(state_file, now)
-    if state is None:
-        return True
-    for race in _targets(state, venues, race_numbers):
-        if datetime.fromisoformat(race["start_time"]) <= now:
-            continue
-        if any(at >= now - timedelta(minutes=late_tolerance) for _, at in _unsent_notifications(state, race, odds_minutes)):
-            return True
-    return False
+        sent = state.get("sent", {}).get(race["race_id"], [])
+        pending += [(start - timedelta(minutes=m), race["race_id"], m) for m in odds_minutes if m not in sent]
+    if not pending:
+        return False, "今日これから送る通知はない"
+    at, race_id, m = min(pending)
+    return True, f"次の通知: {race_id} 発走{m}分前 {at:%H:%M} (残り {len(pending)} 件)"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="推論を実行する必要があるかを判定する")
+    parser = argparse.ArgumentParser(description="今日これから送る通知が残っているかを判定する")
     parser.add_argument("--state-file", default=".inference_state/state.json")
     parser.add_argument("--venues", default="", help="対象の競馬場名 (カンマ区切り). 空なら全場")
     parser.add_argument("--race-numbers", default="7-12")
     parser.add_argument("--odds-minutes-before", default="12")
-    parser.add_argument("--predict-minutes-before-max", type=float, default=50)
-    parser.add_argument("--lookahead", type=float, default=7)  # run.py と揃える
-    parser.add_argument("--late-tolerance", type=float, default=9)  # run.py と揃える
+    parser.add_argument("--min-minutes-before-start", type=float, default=1)  # run.py と揃える
     parser.add_argument("--now", help="現在時刻を上書きする (動作確認用. 例: '2026-11-22 14:30')")
     args = parser.parse_args()
 
     now = datetime.fromisoformat(args.now) if args.now else datetime.now(JST).replace(tzinfo=None)
     venues = [v.strip() for v in args.venues.split(",") if v.strip()]
-    state_file, race_numbers = Path(args.state_file), parse_race_numbers(args.race_numbers)
-    odds_minutes = parse_minutes(args.odds_minutes_before)
-    run, reason = should_run(
-        state_file, now, venues, race_numbers, odds_minutes,
-        args.predict_minutes_before_max, args.lookahead, args.late_tolerance,
+    remaining, reason = next_notification(
+        Path(args.state_file), now, venues, parse_race_numbers(args.race_numbers),
+        parse_minutes(args.odds_minutes_before), args.min_minutes_before_start,
     )
-    remaining = has_remaining(state_file, now, venues, race_numbers, odds_minutes, args.late_tolerance)
-    print(f"{now:%Y-%m-%d %H:%M} (JST): {'実行する' if run else '実行しない'} - {reason}")
-    print(f"今日これから送る通知: {'あり' if remaining else 'なし'}")
+    print(f"{now:%Y-%m-%d %H:%M} (JST): {'実行する' if remaining else '実行しない'} - {reason}")
 
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as f:
-            f.write(f"run={'true' if run else 'false'}\n")
-            f.write(f"remaining={'true' if remaining else 'false'}\n")
+            value = "true" if remaining else "false"
+            f.write(f"run={value}\nremaining={value}\n")
 
 
 if __name__ == "__main__":

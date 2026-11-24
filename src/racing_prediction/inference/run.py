@@ -1,16 +1,17 @@
-"""発走前に予測し, 発走直前のオッズで期待値を計算して通知する. GitHub Actions から 5 分おきに実行する想定.
+"""発走 12 分前に推論を始め, その時点のオッズで期待値を計算して通知する. GitHub Actions で開催日に常駐して実行する.
 
-オッズは発走直前によく変わるため, 「発走 12 分前」(--odds-minutes-before で変更可. カンマ区切りで複数も可) の
-時点のオッズで期待値プラスのワイド ボックスを計算し, メールを送る (1 レースにつき 1 通).
+「発走 12 分前」(--odds-minutes-before で変更可. カンマ区切りで複数も可) になったら推論を始め
+(出馬表・馬体重・戦績・血統を取得して予測. 1 レース 1〜2 分), 続けてその時点のワイドのオッズで
+期待値プラスのワイド ボックスを計算し, メールを送る (1 レースにつき 1 通).
 
 1 回の実行でやること:
     1. その日の時刻表を取得 (初回のみ. 以降は状態ファイルに保存したものを使う)
-    2. 予測: 発走 50〜14 分前のレースの出馬表・戦績・血統を取得して予測し, 結果を状態ファイルに保存する
-       (馬体重は発走 60 分前に発表される. 予測には 1 レース 1〜2 分かかるので, オッズのタイミングより前に済ませておく)
-    3. 通知: 今から --lookahead 分以内に「発走 12 分前」が来るレースがあれば, その時刻まで待ち,
-       その時点のワイドのオッズで全ボックスの期待値を計算してメールを送る (保存した予測を使うので数秒で送れる).
-       GitHub Actions の起動が遅れて時刻を過ぎていても, --late-tolerance 分以内 (かつ発走前) なら送る.
-    4. 送ったタイミングを状態ファイルに記録する (次の実行で重複して送らないため)
+    2. その日の通知が残っている間, 次のレースの「発走 12 分前」まで待つ → 推論 → オッズ取得 → 通知 を繰り返す.
+       起動が遅れてタイミングを過ぎていても, 発走前 (--min-minutes-before-start 分前まで) ならすぐ推論して送る.
+       失敗したら --retry 回まで試す.
+    3. 送ったタイミングを状態ファイルに記録する (次の実行で重複して送らないため)
+    4. --max-runtime-minutes を過ぎてから始まる通知が残っていれば, GITHUB_OUTPUT に continue=true を書いて終了する
+       (GitHub Actions のジョブは最長 6 時間のため. ワークフローが次の実行を起動して続きを処理する)
 
 使い方:
     python -m racing_prediction.inference.run                      # 通常 (今の時刻で判定)
@@ -142,38 +143,32 @@ def target_races(
     return df
 
 
-def races_to_predict(
-    targets: pd.DataFrame, now: pd.Timestamp, predicted: dict, minutes_before_min: float, minutes_before_max: float
-) -> pd.DataFrame:
-    """予測すべきレース (発走 max〜min 分前で, まだ予測していない) を返す."""
-    df = targets[~targets["race_id"].isin(predicted)]
-    minutes_to_start = (df["start_time"] - now).dt.total_seconds() / 60
-    return df[minutes_to_start.between(minutes_before_min, minutes_before_max)]
-
-
-def due_notifications(
+def pending_notifications(
     targets: pd.DataFrame,
     now: pd.Timestamp,
     sent: dict,
     odds_minutes: list[int],
-    lookahead: float,
-    late_tolerance: float,
+    min_minutes_before_start: float,
 ) -> list[tuple[pd.Timestamp, dict, int]]:
-    """今から lookahead 分以内に通知のタイミング (発走 m 分前) が来る, まだ送っていない通知を時刻順に返す.
+    """まだ送っていない通知のうち, 今から発走前 (発走 min_minutes_before_start 分前まで) に送れるものを時刻順に返す.
+
+    通知のタイミング (発走 m 分前) を過ぎていても, 発走前なら返す (起動が遅れた場合でも送るため).
+    同じレースで複数のタイミングを過ぎている場合は, 一番遅いタイミングだけ返す (古いオッズで重ねて送らない).
 
     Returns:
-        [(通知する時刻, レース情報, 発走何分前), ...]
+        [(推論を始める時刻, レース情報, 発走何分前), ...]
     """
     events = []
     for race in targets.to_dict("records"):
-        if race["start_time"] <= now:
+        if race["start_time"] - pd.Timedelta(minutes=min_minutes_before_start) <= now:
             continue
-        for m in odds_minutes:
-            if m in sent.get(race["race_id"], []):
-                continue
-            at = race["start_time"] - pd.Timedelta(minutes=m)
-            if now - pd.Timedelta(minutes=late_tolerance) <= at <= now + pd.Timedelta(minutes=lookahead):
-                events.append((at, race, m))
+        unsent = [
+            (race["start_time"] - pd.Timedelta(minutes=m), race, m)
+            for m in odds_minutes
+            if m not in sent.get(race["race_id"], [])
+        ]
+        passed = [e for e in unsent if e[0] <= now]
+        events += ([passed[-1]] if passed else []) + [e for e in unsent if e[0] > now]
     return sorted(events, key=lambda e: e[0])
 
 
@@ -274,14 +269,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--venues", default="", help="対象の競馬場 (カンマ区切り. 例: 東京,京都). 空なら全場")
     parser.add_argument("--race-numbers", default="7-12", help="対象のレース番号 (例: 7-12, 9,10,11)")
     parser.add_argument("--odds-minutes-before", default="12", help="オッズを取得して通知するタイミング (発走何分前. カンマ区切りで複数も可)")
-    parser.add_argument("--predict-minutes-before-max", type=float, default=50, help="発走何分前から予測するか")
-    # 5 分おきの起動で取りこぼさない範囲で小さくする (待機時間も GitHub Actions の実行時間に数えられるため)
-    parser.add_argument("--lookahead", type=float, default=7, help="今から何分先までの通知のタイミングを, 待って処理するか")
-    # GitHub Actions の定期実行は混雑時に 15〜20 分起動しないことがあるため, 遅れても発走前なら送れるよう広めにとる
-    # (発走 12 分前の通知なら, 発走 3 分前までに起動できれば送る. lookahead と合わせて 16 分の空白まで吸収できる)
-    parser.add_argument("--late-tolerance", type=float, default=9, help="通知のタイミングを何分過ぎていても送るか")
+    parser.add_argument(
+        "--min-minutes-before-start", type=float, default=1,
+        help="起動が遅れてタイミングを過ぎていても, 発走何分前までなら推論・通知するか",
+    )
+    # GitHub Actions のジョブは最長 6 時間. それより前に終了し, 続きは次の実行 (ワークフローが自分で起動する) に任せる
+    parser.add_argument(
+        "--max-runtime-minutes", type=float, default=0,
+        help="この分数を過ぎてから始まる通知は次の実行に任せて終了する (GITHUB_OUTPUT に continue=true を書く). 0 なら無制限",
+    )
+    parser.add_argument("--retry", type=int, default=3, help="推論・通知に失敗したときに何回まで試すか")
     parser.add_argument("--race-id", help="時刻に関係なく, このレースを今のオッズで予測する (動作確認用)")
-    parser.add_argument("--now", help="現在時刻を上書きする (動作確認用. 例: '2026-11-22 14:30'. 待機もしない)")
+    parser.add_argument("--now", help="現在時刻を上書きする (動作確認用. 例: '2026-11-22 14:30'. 待機せず, 残りを全部すぐ処理する)")
     parser.add_argument("--no-wait", action="store_true", help="通知のタイミングまで待たずにすぐ処理する (動作確認用)")
     parser.add_argument("--dry-run", action="store_true", help="通知せずに本文を表示する")
     parser.add_argument(
@@ -331,10 +330,10 @@ def main(argv: list[str] | None = None) -> int:
             model.update(booster=booster, builder=builder)
         return model["booster"], model["builder"]
 
-    def ensure_prediction(race_info: dict) -> tuple[dict, pd.DataFrame]:
-        """予測済みならそれを使い, なければ予測して状態ファイルに保存する."""
+    def ensure_prediction(race_info: dict, fresh: bool = False) -> tuple[dict, pd.DataFrame]:
+        """予測済みならそれを使い (fresh=True なら予測し直す), なければ予測して状態ファイルに保存する."""
         saved = state["predictions"].get(race_info["race_id"])
-        if saved:
+        if saved and not fresh:
             return {**race_info, **saved["race_info"]}, pred_from_state(saved["pred"])
         print(f"{race_info['race_id']}: 予測しています...")
         info, pred = predict_race(race_info, *get_model())
@@ -356,53 +355,63 @@ def main(argv: list[str] | None = None) -> int:
         send(*build_report(info, pred, betting, label="手動実行", model_version=model_version_label(args.model_dir)), args.dry_run)
         return 0
 
+    # 常駐: その日の通知が残っている間, 「発走 12 分前」になるまで待ち, その時点で推論を始めて
+    # (出馬表・馬体重・戦績を取得して予測 → その時点のワイドのオッズで期待値を計算) メールを送る.
+    # GitHub Actions の定期実行 (schedule) は数十分起動しないことがあるため, 起動のタイミングに頼らず
+    # 1 回の実行の中で時刻まで待つ.
+    started = now_jst()
+    deadline = started + pd.Timedelta(minutes=args.max_runtime_minutes) if args.max_runtime_minutes > 0 else None
+    sent_local = {k: list(v) for k, v in state["sent"].items()}  # dry-run でも同じ通知を繰り返さないため
+    gave_up: set[tuple[str, int]] = set()
+    attempts: dict[tuple[str, int], int] = {}
     failed = []
+    to_continue = False
 
-    # 1) 予測: 発走 50〜(最初の通知タイミング + 2) 分前のレースを, 通知より前に予測しておく
-    #    (通知のタイミングが近いレースを優先する)
-    events = due_notifications(targets, now, state["sent"], odds_minutes, args.lookahead, args.late_tolerance)
-    need = races_to_predict(targets, now, state["predictions"], max(odds_minutes) + 2, args.predict_minutes_before_max)
-    to_predict = [race for _, race, _ in events] + need.sort_values("start_time").to_dict("records")
-    seen = set()
-    for race in to_predict:
-        if race["race_id"] in seen or race["race_id"] in state["predictions"]:
-            continue
-        seen.add(race["race_id"])
-        try:
-            ensure_prediction(race)
-        except Exception:
-            print(f"{race['race_id']}: 予測に失敗しました (次回の実行で再試行します)")
-            traceback.print_exc()
-            state["failures"][race["race_id"]] = state["failures"].get(race["race_id"], 0) + 1
-            save_state(state_path, state)
-            failed.append(race["race_id"])
-
-    # 2) 通知: 発走 m 分前になるまで待ち, その時点のオッズで期待値を計算して送る
-    events = due_notifications(targets, current_time(), state["sent"], odds_minutes, args.lookahead, args.late_tolerance)
-    if not events:
-        print("今から送る通知はありません")
-    for at, race, m in events:
+    while True:
+        events = [
+            e for e in pending_notifications(targets, current_time(), sent_local, odds_minutes, args.min_minutes_before_start)
+            if (e[1]["race_id"], e[2]) not in gave_up
+        ]
+        if not events:
+            print("今日これから送る通知はありません")
+            break
+        at, race, m = events[0]
         race_id = race["race_id"]
-        if race_id not in state["predictions"]:
-            continue  # 予測に失敗したレース
+        if deadline is not None and at > deadline and fixed_now is None:
+            # 次の実行に引き継ぐ. 次のタイミングまで余裕があるうちに終了し, 次の実行の起動を待つ時間を確保する
+            print(f"実行時間の上限が近いため終了します. 次は {race_id} 発走{m}分前 ({at:%H:%M}) から次の実行で処理します")
+            to_continue = True
+            break
         wait = (at - current_time()).total_seconds()
         if wait > 0 and not no_wait:
             print(f"{race_id}: 発走{m}分前 ({at:%H:%M}) まで {wait / 60:.1f} 分待ちます", flush=True)
             time.sleep(wait)
-        if current_time() >= race["start_time"]:
-            print(f"{race_id}: 発走時刻を過ぎたため, 発走{m}分前の通知を送りません")
-            continue
+        elif wait < -30:
+            print(f"{race_id}: 発走{m}分前 ({at:%H:%M}) を {-wait / 60:.1f} 分過ぎていますが, 発走前なので今から推論します")
+        key = (race_id, m)
+        attempts[key] = attempts.get(key, 0) + 1
         try:
-            info, pred = ensure_prediction(race)
+            # 最初のタイミング (発走 12 分前) では必ずその時点で推論し直す (馬体重・出走取消などを反映)
+            info, pred = ensure_prediction(race, fresh=(m == odds_minutes[0]))
             send(*build_report(info, pred, betting, label=f"発走{m}分前", model_version=model_version_label(args.model_dir)), args.dry_run)
+            sent_local.setdefault(race_id, []).append(m)
             if not args.dry_run:
                 state["sent"].setdefault(race_id, []).append(m)
                 save_state(state_path, state)
         except Exception:
-            print(f"{race_id}: 発走{m}分前の通知に失敗しました")
+            print(f"{race_id}: 発走{m}分前の推論・通知に失敗しました ({attempts[key]}/{args.retry} 回目)")
             traceback.print_exc()
-            failed.append(race_id)
+            state["failures"][race_id] = state["failures"].get(race_id, 0) + 1
+            save_state(state_path, state)
+            if attempts[key] >= args.retry:
+                gave_up.add(key)
+                failed.append(race_id)
+            elif not no_wait:
+                time.sleep(20)
 
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"continue={'true' if to_continue else 'false'}\n")
     # 失敗があれば終了コードを 1 にする (GitHub Actions の実行が失敗扱いになり, 気づける)
     return 1 if failed else 0
 

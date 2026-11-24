@@ -1,19 +1,21 @@
-# 毎朝 1 回, 今日が「対象レースがある日」かを判定し, 推論ワークフロー (race-inference) を有効 / 無効にする.
+# 毎朝, 今日が「対象レースがある日」かを判定し, 推論ワークフロー (race-inference) を有効 / 無効にする.
 #
-# - 対象レースがある日 → race-inference を有効にする (9:00〜 5 分おきに起動して予測する)
+# - 対象レースがある日 → race-inference を有効にして起動する (常駐し, 各レースの発走 12 分前に推論して通知する)
 # - 対象レースがない日 (非開催日, または対象の競馬場で開催がない日) → race-inference を無効にする
-#   (無効の間は 10 分おきの起動自体が行われないので, GitHub Actions の無料枠を消費しない)
-# - 時刻表の取得に失敗した場合は非開催日と判定せず, race-inference を有効にする
+#   (無効の間は予備の定期実行も行われないので, GitHub Actions の実行時間を消費しない)
+# - 時刻表の取得に失敗した場合は非開催日と判定せず, race-inference を有効にして起動する
 #   (race-inference 側で時刻表の取得を再試行する)
+# - race-inference がすでに実行中・待機中なら, 重ねて起動しない
 # - 取得した時刻表は状態ファイルとしてキャッシュに保存し, race-inference が引き継ぐ
 name: race-day-planner
 
 on:
   schedule:
-    # UTC 23:17 (前日) = 日本時間 8:17 (race-inference の起動開始 9:00 より前). 毎日
-    # 第 1 レース (10:00 前後発走) の予測は発走 50 分前 (9:10 頃) から始まるため, それより十分前に有効にしておく.
+    # UTC 23:17, 23:47 (前日) = 日本時間 8:17, 8:47. 毎日
+    # 第 1 レース (10:00 前後発走) の推論は発走 12 分前 (9:48 頃) に始まるため, それより十分前に起動しておく.
+    # 定期実行は混雑時に起動しないことがあるため 2 回にしている (2 回目は, 起動済みなら何もしない).
     # 毎時 0 分は GitHub Actions が混雑して起動が遅れやすいので, 半端な分にしている
-    - cron: "17 23 * * *"
+    - cron: "17,47 23 * * *"
   workflow_dispatch:
 
 permissions:
@@ -56,6 +58,14 @@ jobs:
           PYTHONPATH: src
         run: python -m racing_prediction.inference.run --prepare-only --venues "$VENUES" --race-numbers "$RACE_NUMBERS"
 
+      # race-inference が起動時に読めるよう, 起動する前に保存する
+      - name: Save state
+        if: always() && hashFiles('.inference_state/**') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: .inference_state
+          key: inference-state-${{ github.run_id }}
+
       - name: Enable or disable race-inference
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,18 +79,23 @@ jobs:
           if [ "$RACE_DAY" = "false" ]; then
             if [ "$current" = "active" ]; then gh api -X PUT "$api/disable"; fi
             echo "対象レースがないため race-inference を無効にしました"
-          else
-            if [ "$current" != "active" ]; then gh api -X PUT "$api/enable"; fi
-            if [ "$RACE_DAY" = "true" ]; then
-              echo "対象レースがあるため race-inference を有効にしました"
-            else
-              echo "時刻表の取得に失敗したため, 念のため race-inference を有効にしました"
-            fi
+            exit 0
           fi
-
-      - name: Save state
-        if: always() && hashFiles('.inference_state/**') != ''
-        uses: actions/cache/save@v6
-        with:
-          path: .inference_state
-          key: inference-state-${{ github.run_id }}
+          if [ "$current" != "active" ]; then gh api -X PUT "$api/enable"; fi
+          if [ "$RACE_DAY" = "true" ]; then
+            echo "対象レースがあるため race-inference を有効にしました"
+          else
+            echo "時刻表の取得に失敗したため, 念のため race-inference を有効にしました"
+          fi
+          # すでに実行中・待機中なら重ねて起動しない (常駐している実行がそのまま通知する)
+          active=0
+          for status in in_progress queued waiting pending; do
+            n=$(gh api "$api/runs?status=$status&per_page=1" --jq .total_count)
+            active=$((active + n))
+          done
+          if [ "$active" -gt 0 ]; then
+            echo "race-inference はすでに実行中・待機中のため, 起動しません"
+          else
+            gh workflow run race-inference.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+            echo "race-inference を起動しました"
+          fi
