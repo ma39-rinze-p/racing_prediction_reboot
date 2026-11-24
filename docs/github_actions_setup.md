@@ -74,11 +74,25 @@ python scripts/train_on_kaggle.py --update-dataset
 
 ### 実行結果の保存先
 
-Kaggle での実行結果は, 実行ごとにローカルの `reports/kaggle_runs/<日時>/` に保存される (git 管理外).
+Kaggle での実行結果は, ローカルの `reports/kaggle_runs/` に **学習した日付ごとのフォルダ** を作り,
+その下に **学習の実行ごとに, モデルのバージョン名のフォルダ** で保存される (git 管理外).
+バージョン名は `v{学習した日付_時刻}` (日本時間. 例: `v20261124_153012`).
 
 ```
-reports/kaggle_runs/20261123_103000/
-├── artifacts/                      学習済みモデル (models/production/ にも取り込まれる)
+reports/kaggle_runs/
+├── 20261124/                           学習した日付
+│   ├── v20261124_153012/               1 回目の学習 (バージョン名)
+│   ├── v20261124_201845/               2 回目の学習
+│   └── error_210512/                   失敗した実行のログ (error_<時刻>)
+└── 20261125/
+    └── v20261125_093001/
+```
+
+各バージョンのフォルダの中身:
+
+```
+v20261124_153012/
+├── artifacts/                      学習済みモデル (models/registry/ に登録される)
 │   ├── model.txt / metadata.json / feature_importance.csv
 ├── results/                        評価結果
 │   ├── summary.json                設定, 学習・テスト期間, CV / テストの評価指標 (モデルと単勝オッズ), 最良パラメータ
@@ -91,7 +105,8 @@ reports/kaggle_runs/20261123_103000/
 └── predict-jra-racing.log          Kaggle の元のログ (JSON)
 ```
 
-失敗した実行のログは `reports/kaggle_runs/<日時>_error/` に保存され, エラー部分が画面にも表示される.
+失敗した実行のログは `reports/kaggle_runs/<日付>/error_<時刻>/` に保存され, エラー部分が画面にも表示される.
+同じ実行の出力を取り込み直した場合 (`--fetch-only` など) は, 同じバージョンのフォルダを置き換える (二重に登録しない).
 ローカルでノートブックを実行した場合の評価結果は `reports/latest/` に保存される.
 
 - 実行中にウィンドウを閉じても Kaggle 側の実行は続く. その場合は完了後に `--fetch-only` で取り込む
@@ -257,11 +272,19 @@ GitHub のリポジトリ画面 → **Settings → Secrets and variables → Act
 
 ```
 models/registry/
-├── registry.json        各バージョンの学習期間・テストの精度と, 適用の履歴
-├── v001/ v002/ ...      各バージョンのモデル
-models/production/       今適用しているバージョンのコピー (GitHub Actions の推論はここを読む)
-└── VERSION.txt          今適用しているバージョン番号
+├── registry.json            各バージョンの学習期間・テストの精度 (モデルと単勝オッズ) と, 適用の履歴
+├── v20261124_153012/        各バージョン (v{学習した日付_時刻})
+│   ├── model.txt / metadata.json / feature_importance.csv   モデル
+│   └── summary.json / roc_curve.png / calibration.csv       テストの評価結果 (ROC-AUC, ROC 曲線など)
+└── v20261125_093001/
+models/production/           今適用しているバージョンのコピー (GitHub Actions の推論はここを読む)
+├── model.txt / metadata.json / feature_importance.csv
+├── summary.json / roc_curve.png / calibration.csv   適用中のモデルのテストの評価結果
+├── METRICS.md               適用中のモデルの精度のまとめ (ROC-AUC などの単勝オッズとの比較表と ROC 曲線. GitHub の画面で読める)
+└── VERSION.txt              今適用しているバージョン名
 ```
+
+- バージョン名は `v{学習した日付_時刻}` (日本時間). 学習時に `metadata.json` の `trained_at` に記録した日時から決める.
 
 - **既定 (自動モード) では, 登録済みの全バージョンのうちテストの ROC-AUC が最良のモデルが GitHub Actions の推論に使われる.**
   `train_on_kaggle.py` で学習すると, 新しいモデルは新しいバージョンとして自動で登録され, そのたびに
@@ -269,7 +292,7 @@ models/production/       今適用しているバージョンのコピー (GitHu
 - `promote` / `rollback` で手動で選んだ場合は **手動モード** になり, そのモデルに固定される
   (新しいモデルを取り込んでも切り替わらない). `best` で自動モードに戻る.
 - 通知メールの末尾に, 使ったモデルのバージョン・学習期間・テストの ROC-AUC が表示される.
-  例: `※ モデル: v001 (学習期間 2025-11-23〜2026-11-22 / テストのROC-AUC 0.750 (レース内 0.731))`
+  例: `※ モデル: v20261124_153012 (学習期間 2025-11-23〜2026-11-22 / テストのROC-AUC 0.758 (レース内 0.752))`
 - `train_on_kaggle.py` のオプション: `--force-promote` (ROC-AUC に関係なく新しいモデルを適用. 手動モード) / `--no-promote` (登録だけ)
 
 | コマンド | 内容 |
@@ -277,7 +300,7 @@ models/production/       今適用しているバージョンのコピー (GitHu
 | `python scripts/model_registry.py list` | バージョンの一覧 (`*` が適用中, `★` が ROC-AUC 最良), 適用モード, 適用の履歴 |
 | `python scripts/model_registry.py best` | 自動モードに戻し, ROC-AUC が最良のバージョンを適用する |
 | `python scripts/model_registry.py rollback` | 1 つ前に適用していたモデルに戻す (続けて実行すると, さらに前へ戻る. 手動モード) |
-| `python scripts/model_registry.py promote v002` | 指定したバージョンを適用する (手動モード) |
+| `python scripts/model_registry.py promote v20261124_153012` | 指定したバージョンを適用する (手動モード) |
 | `python scripts/model_registry.py register <フォルダ>` | 手動でダウンロードしたモデルを登録する |
 
 適用 (`promote` / `rollback`) したら, GitHub Actions に反映するため `models` を commit して main に push する.

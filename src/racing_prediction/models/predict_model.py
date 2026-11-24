@@ -40,6 +40,11 @@ def load_artifacts(model_dir: str | Path) -> tuple[lgb.Booster, FeatureBuilder, 
     (以前の 3 着以内を予測するモデルの出力を 1 着の確率として扱うと, 誤った予想を送ってしまうため).
     """
     model_dir = Path(model_dir)
+    if not (model_dir / "metadata.json").exists() or not (model_dir / "model.txt").exists():
+        raise FileNotFoundError(
+            f"{model_dir} にモデル (model.txt, metadata.json) がありません. "
+            "python scripts/train_on_kaggle.py --update-dataset で学習し, models/production を commit & push してください."
+        )
     metadata = json.loads((model_dir / "metadata.json").read_text(encoding="utf-8"))
     target = metadata.get("target", "is_top3")  # target がない = 1 着モデル導入前の 3 着以内モデル
     if target != MODEL_TARGET:

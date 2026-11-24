@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import lightgbm as lgb
 import numpy as np
@@ -297,6 +299,8 @@ def save_artifacts(
     output_dir.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(output_dir / "model.txt"))
     metadata = {
+        # 学習した日時 (日本時間). モデルのバージョン名 (v{日付_時刻}) に使う (scripts/model_registry.py)
+        "trained_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds"),
         "target": MODEL_TARGET,  # 推論側 (load_artifacts) はこれが "is_win" のモデルだけを使う
         "objective": OBJECTIVE_NAME,
         "feature_builder": builder.to_dict(),

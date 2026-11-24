@@ -6,10 +6,11 @@
     2. 作業用フォルダ (OS の一時フォルダ) に, ノートブック (出力は消す) と kernel-metadata.json を用意する
     3. kaggle kernels push でノートブックを Kaggle に送り, 最初から最後まで実行する (= Save & Run All)
     4. kaggle kernels status で実行が終わるまで待つ
-    5. kaggle kernels output で出力一式をダウンロードして reports/kaggle_runs/<日時>/ に保存し,
-       モデルを新しいバージョンとして models/registry/ に登録する. 自動モード (既定) なら, 登録済みの全バージョンの
-       うちテストの ROC-AUC が最良のものを models/production/ に適用する (scripts/model_registry.py).
-       (失敗した場合もログを reports/kaggle_runs/<日時>_error/ に保存する)
+    5. kaggle kernels output で出力一式をダウンロードして reports/kaggle_runs/<学習した日付>/<バージョン名>/ に保存し,
+       モデルを新しいバージョン (v{学習した日付_時刻}) として models/registry/ に登録する. 自動モード (既定) なら,
+       登録済みの全バージョンのうちテストの ROC-AUC が最良のものを models/production/ に適用する
+       (評価結果 summary.json・roc_curve.png と精度のまとめ METRICS.md も models/production/ に置く. scripts/model_registry.py).
+       (失敗した場合もログを reports/kaggle_runs/<日付>/error_<時刻>/ に保存する)
 
 使い方 (リポジトリのルートで実行):
     python scripts/train_on_kaggle.py --update-dataset   # データ・コード・設定を更新してから学習 (通常はこれ)
@@ -249,9 +250,9 @@ def parse_kernel_status(text: str) -> str:
 
 
 def show_kernel_error(kernel: str, max_lines: int = 40) -> None:
-    """失敗した実行のログを reports/kaggle_runs/<日時>_error/ に保存し, エラー (Traceback 以降) を表示する."""
+    """失敗した実行のログを reports/kaggle_runs/<日付>/error_<時刻>/ に保存し, エラー (Traceback 以降) を表示する."""
     try:
-        run_dir = download_kernel_output(kernel, suffix="_error")
+        run_dir = download_kernel_output(kernel, error=True)
     except subprocess.CalledProcessError:
         print("(ログを取得できませんでした)")
         return

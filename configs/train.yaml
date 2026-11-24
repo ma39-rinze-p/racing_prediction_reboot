@@ -4,7 +4,7 @@
 
 data:
   # 学習・テストに使うデータの期間 (開催日, 両端を含む). null なら制限なし
-  start_date: "2023-11-23"
+  start_date: "2025-11-23"
   end_date: "2026-11-22"
 
 split:
@@ -14,7 +14,7 @@ split:
 
 tuning:
   # Optuna の試行回数
-  n_trials: 2000
+  n_trials: 500
   # Optuna の打ち切り時間 (秒). null なら試行回数だけで止める
   timeout_sec: 3600
   # 学習期間内の時系列 CV の fold 数 (データが少ないとエラーになるので, その場合は小さくする)

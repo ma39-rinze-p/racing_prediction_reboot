@@ -1,209 +1,12 @@
 {
-  "active": "v002",
+  "active": "v20261124_213539",
+  "policy": "best",
   "versions": {
-    "v001": {
-      "registered_at": "2026-11-23 05:23:33",
-      "source": "registry 導入前の models/production",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7306129741314925,
-        "roc_auc": 0.7501803063085997,
-        "logloss": 0.4532046542588267,
-        "top3_precision": 0.4506172839506172,
-        "wide_top_pair_hit": 0.2037037037037037
-      }
-    },
-    "v002": {
-      "registered_at": "2026-11-23 05:39:10",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_053859)",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7456226900671346,
-        "roc_auc": 0.759831996945399,
-        "logloss": 0.4507499595242377,
-        "top3_precision": 0.45679012345679,
-        "wide_top_pair_hit": 0.16666666666666666
-      }
-    },
-    "v003": {
-      "registered_at": "2026-11-23 05:53:17",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_055113)",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7306129741314925,
-        "roc_auc": 0.7501803063085997,
-        "logloss": 0.4532046542588267,
-        "top3_precision": 0.4506172839506172,
-        "wide_top_pair_hit": 0.2037037037037037
-      }
-    },
-    "v004": {
-      "registered_at": "2026-11-23 06:04:51",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_060438)",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7306129741314925,
-        "roc_auc": 0.7501803063085997,
-        "logloss": 0.4532046542588267,
-        "top3_precision": 0.4506172839506172,
-        "wide_top_pair_hit": 0.2037037037037037
-      }
-    },
-    "v005": {
-      "registered_at": "2026-11-23 06:21:50",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_062137)",
-      "train_period": [
-        "2024-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 525,
-      "test_period": [
-        "2026-06-20",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7138147677867306,
-        "roc_auc": 0.7305480753999684,
-        "logloss": 0.46323451101857227,
-        "top3_precision": 0.42990654205607476,
-        "wide_top_pair_hit": 0.18691588785046728
-      }
-    },
-    "v006": {
-      "registered_at": "2026-11-23 06:31:21",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_063110)",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7330726029800104,
-        "roc_auc": 0.7492151372449195,
-        "logloss": 0.45350661275884174,
-        "top3_precision": 0.4567901234567901,
-        "wide_top_pair_hit": 0.25925925925925924
-      }
-    },
-    "v007": {
-      "registered_at": "2026-11-23 06:47:25",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_064713)",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7306129741314925,
-        "roc_auc": 0.7501803063085997,
-        "logloss": 0.4532046542588267,
-        "top3_precision": 0.4506172839506172,
-        "wide_top_pair_hit": 0.2037037037037037
-      }
-    },
-    "v008": {
-      "registered_at": "2026-11-23 07:00:20",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_070009)",
-      "train_period": [
-        "2025-05-24",
-        "2026-11-22"
-      ],
-      "n_train_races": 417,
-      "test_period": [
-        "2026-10-10",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.704762227954999,
-        "roc_auc": 0.72380285108507,
-        "logloss": 0.4721933323923879,
-        "top3_precision": 0.40963855421686746,
-        "wide_top_pair_hit": 0.1686746987951807
-      }
-    },
-    "v009": {
-      "registered_at": "2026-11-23 07:14:22",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_071406)",
-      "train_period": [
-        "2026-05-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 154,
-      "test_period": [
-        "2026-11-07",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.708633434466768,
-        "roc_auc": 0.7456716417910448,
-        "logloss": 0.45068052807621994,
-        "top3_precision": 0.4444444444444444,
-        "wide_top_pair_hit": 0.3333333333333333
-      }
-    },
-    "v010": {
-      "registered_at": "2026-11-23 07:42:02",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_074149)",
-      "train_period": [
-        "2025-11-23",
-        "2026-11-22"
-      ],
-      "n_train_races": 268,
-      "test_period": [
-        "2026-10-24",
-        "2026-11-22"
-      ],
-      "test_metrics": {
-        "roc_auc_by_race": 0.7306129741314925,
-        "roc_auc": 0.7501803063085997,
-        "logloss": 0.4532046542588267,
-        "top3_precision": 0.4506172839506172,
-        "wide_top_pair_hit": 0.2037037037037037
-      }
-    },
-    "v011": {
-      "registered_at": "2026-11-23 11:14:14",
-      "source": "Kaggle ma39rinzep/predict-jra-racing (20261123_111402)",
+    "v20261124_204146": {
+      "registered_at": "2026-11-24 20:42:57",
+      "source": "Kaggle ma39rinzep/predict-jra-racing (reports/kaggle_runs/20261124/v20261124_204146)",
+      "target": "is_win",
+      "trained_at": "2026-11-24T20:41:46+09:00",
       "train_period": [
         "2023-11-25",
         "2026-11-22"
@@ -214,30 +17,70 @@
         "2026-11-22"
       ],
       "test_metrics": {
-        "roc_auc_by_race": 0.718077927197424,
-        "roc_auc": 0.7361150310400296,
-        "logloss": 0.4536130307940076,
-        "top3_precision": 0.4318658280922432,
-        "wide_top_pair_hit": 0.18867924528301888
+        "roc_auc_by_race": 0.7502124211752403,
+        "roc_auc": 0.7582748987578394,
+        "logloss": 2.2612063408771443,
+        "win_hit": 0.27672955974842767,
+        "top3_precision": 0.4129979035639412,
+        "wide_top_pair_hit": 0.18238993710691823
+      },
+      "test_odds_baseline": {
+        "roc_auc_by_race": 0.826457975986278,
+        "roc_auc": 0.8420089051626837,
+        "logloss": 1.9326334584777598,
+        "win_hit": 0.36477987421383645,
+        "top3_precision": 0.5094339622641509,
+        "wide_top_pair_hit": 0.3081761006289308
+      }
+    },
+    "v20261124_213539": {
+      "registered_at": "2026-11-24 21:37:00",
+      "source": "Kaggle ma39rinzep/predict-jra-racing (reports/kaggle_runs/20261124/v20261124_213539)",
+      "target": "is_win",
+      "trained_at": "2026-11-24T21:35:39+09:00",
+      "train_period": [
+        "2025-11-23",
+        "2026-11-22"
+      ],
+      "n_train_races": 268,
+      "test_period": [
+        "2026-10-24",
+        "2026-11-22"
+      ],
+      "test_metrics": {
+        "roc_auc_by_race": 0.758816292639822,
+        "roc_auc": 0.7762882447665056,
+        "logloss": 2.18272166640066,
+        "win_hit": 0.2962962962962963,
+        "top3_precision": 0.41358024691358025,
+        "wide_top_pair_hit": 0.14814814814814814
+      },
+      "test_odds_baseline": {
+        "roc_auc_by_race": 0.8507436674920333,
+        "roc_auc": 0.8687332259796029,
+        "logloss": 1.7658190183393867,
+        "win_hit": 0.4444444444444444,
+        "top3_precision": 0.5370370370370371,
+        "wide_top_pair_hit": 0.3333333333333333
       }
     }
   },
   "history": [
     {
-      "version": "v001",
-      "activated_at": "2026-11-23 05:23:33",
-      "reason": "初期登録"
+      "version": "v20261124_204146",
+      "activated_at": "2026-11-24 20:42:57",
+      "reason": "v20261124_204146 を登録 (ROC-AUC が最良のモデルを自動で適用)",
+      "previous": null
     },
     {
-      "version": "v002",
-      "activated_at": "2026-11-23 05:39:10",
-      "reason": "v002 を登録 (ROC-AUC が最良のモデルを自動で適用)",
-      "previous": "v001"
+      "version": "v20261124_213539",
+      "activated_at": "2026-11-24 21:37:00",
+      "reason": "v20261124_213539 を登録 (ROC-AUC が最良のモデルを自動で適用)",
+      "previous": "v20261124_204146"
     }
   ],
   "stack": [
-    "v001",
-    "v002"
-  ],
-  "policy": "best"
+    "v20261124_204146",
+    "v20261124_213539"
+  ]
 }
