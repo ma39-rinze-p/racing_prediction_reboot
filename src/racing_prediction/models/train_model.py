@@ -1,10 +1,17 @@
 """train_model
 
-LightGBM (二値分類: 3 着以内か否か) の学習.
+LightGBM で各馬が 1 着になる確率を予測するモデル (条件付きロジット / レース内ソフトマックス) の学習.
+
+モデル:
+    LightGBM が各馬の強さの対数 (win_score) を出力し, レース内でソフトマックスをとって 1 着の確率にする.
+        p_win(i) = exp(win_score(i)) / Σ_{同じレースの馬 j} exp(win_score(j))
+    → レースごとの確率の合計は必ず 1 になる. 学習では「1 着の馬に付けた確率の -log」(レース単位の logloss) を
+      最小化する (ソフトマックス交差エントロピー. LightGBM のカスタム目的関数で実装).
+    同着で 1 着が複数いるレースは, 正解を 1 着の馬で等分する (例: 2 頭なら 0.5 ずつ).
 
 方針:
     - 検証は必ず時系列で行う (学習 = 過去, 検証 = その後). 1 レースの馬は同じ側に入れる.
-    - Optuna は「テスト期間より前」のデータだけで, 期間をずらした時系列 CV の logloss を最小化する.
+    - Optuna は「テスト期間より前」のデータだけで, 期間をずらした時系列 CV のレース単位の logloss を最小化する.
     - カテゴリの種類などの前処理も fold ごとに学習側だけで fit する (リーク防止).
 """
 
@@ -21,13 +28,15 @@ import pandas as pd
 
 from racing_prediction.data.make_dataset import TARGET_COLUMN
 from racing_prediction.features.model_features import FeatureBuilder
-from racing_prediction.models.predict_model import evaluate_predictions, predict_top3
+from racing_prediction.models.predict_model import MODEL_TARGET, PROB_FLOOR, evaluate_predictions, predict_win
 
 SEED = 42
+OBJECTIVE_NAME = "race_softmax"  # レース内ソフトマックス交差エントロピー (カスタム目的関数. 保存する params での名前)
+METRIC_NAME = "race_logloss"
 
 BASE_PARAMS = {
-    "objective": "binary",
-    "metric": "binary_logloss",
+    "objective": OBJECTIVE_NAME,  # 学習時に race_softmax_objective に置き換える
+    "metric": "None",  # 評価指標はカスタム (race_logloss_metric)
     "learning_rate": 0.05,
     "bagging_freq": 1,
     "verbosity": -1,
@@ -102,24 +111,89 @@ def time_series_folds(dates: pd.Series, n_folds: int = 3, valid_ratio: float = 0
 
 
 # ---------------------------------------------------------------------------
+# レース内ソフトマックス (条件付きロジット) の目的関数・評価指標
+# ---------------------------------------------------------------------------
+def _group_softmax(scores: np.ndarray, group: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """連続して並んだグループ (各要素はグループの行数) ごとのソフトマックスと, 各行のグループ番号を返す."""
+    gid = np.repeat(np.arange(len(group)), group)
+    starts = np.concatenate([[0], np.cumsum(group)[:-1]])
+    e = np.exp(scores - np.maximum.reduceat(scores, starts)[gid])
+    return e / np.add.reduceat(e, starts)[gid], gid
+
+
+def _race_targets(label: np.ndarray, group: np.ndarray) -> np.ndarray:
+    """正解 (1 着なら 1) をレース内で合計 1 にする (同着なら 1 着の馬で等分)."""
+    starts = np.concatenate([[0], np.cumsum(group)[:-1]])
+    gid = np.repeat(np.arange(len(group)), group)
+    total = np.add.reduceat(label, starts)[gid]
+    return np.divide(label, total, out=np.zeros_like(label, dtype=float), where=total > 0)
+
+
+def race_softmax_objective(preds: np.ndarray, data: lgb.Dataset) -> tuple[np.ndarray, np.ndarray]:
+    """レース内ソフトマックス交差エントロピーの勾配とヘッセ行列の対角 (LightGBM のカスタム目的関数)."""
+    group = data.get_group().astype(int)
+    p, _ = _group_softmax(preds, group)
+    y = _race_targets(data.get_label().astype(float), group)
+    return p - y, np.maximum(p * (1 - p), 1e-6)
+
+
+def race_logloss_metric(preds: np.ndarray, data: lgb.Dataset) -> tuple[str, float, bool]:
+    """レース単位の logloss (1 着の馬に付けた確率の -log の平均) (LightGBM のカスタム評価指標)."""
+    group = data.get_group().astype(int)
+    p, _ = _group_softmax(preds, group)
+    y = _race_targets(data.get_label().astype(float), group)
+    starts = np.concatenate([[0], np.cumsum(group)[:-1]])
+    p_winner = np.add.reduceat(p * (y > 0), starts)
+    return METRIC_NAME, float(-np.log(np.clip(p_winner, PROB_FLOOR, None)).mean()), False
+
+
+def _prepare(df: pd.DataFrame) -> pd.DataFrame:
+    """学習に使えるレースだけにして, 同じレースの馬が連続して並ぶよう並べ替える.
+
+    1 着の馬がいないレース (全頭が中止など) は正解がないので除く.
+    """
+    df = df[df[TARGET_COLUMN].notna()]
+    has_winner = df[TARGET_COLUMN].astype(int).groupby(df["race_id"]).transform("sum") > 0
+    return df[has_winner].sort_values(["race_date", "race_id", "umaban"], kind="stable").reset_index(drop=True)
+
+
+def _dataset(df: pd.DataFrame, builder: FeatureBuilder, reference: lgb.Dataset | None = None) -> lgb.Dataset:
+    group = df.groupby("race_id", sort=False).size().to_numpy()
+    return lgb.Dataset(
+        builder.transform(df), label=df[TARGET_COLUMN].astype(int).to_numpy(), group=group,
+        reference=reference, free_raw_data=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 学習
 # ---------------------------------------------------------------------------
+def _lgb_params(params: dict) -> dict:
+    """保存用の params を LightGBM に渡す形にする (カスタム目的関数を関数に置き換える)."""
+    lgb_params = {k: v for k, v in params.items() if k != "min_category_count"}
+    lgb_params["objective"] = race_softmax_objective
+    lgb_params["metric"] = "None"
+    return lgb_params
+
+
 def _fit_one(params: dict, train: pd.DataFrame, valid: pd.DataFrame | None = None, num_boost_round: int | None = None):
     """前処理の fit + LightGBM の学習. valid があれば early stopping する."""
+    train = _prepare(train)
     builder = FeatureBuilder(min_category_count=params.get("min_category_count", 5)).fit(train)
-    lgb_params = {k: v for k, v in params.items() if k != "min_category_count"}
+    lgb_params = _lgb_params(params)
 
-    dtrain = lgb.Dataset(builder.transform(train), label=train[TARGET_COLUMN].astype(int), free_raw_data=False)
+    dtrain = _dataset(train, builder)
     if valid is None:
         booster = lgb.train(lgb_params, dtrain, num_boost_round=num_boost_round)
         return builder, booster
 
-    dvalid = lgb.Dataset(builder.transform(valid), label=valid[TARGET_COLUMN].astype(int), reference=dtrain)
+    dvalid = _dataset(_prepare(valid), builder, reference=dtrain)
     booster = lgb.train(
         lgb_params,
         dtrain,
         num_boost_round=MAX_BOOST_ROUND,
         valid_sets=[dvalid],
+        feval=race_logloss_metric,
         callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
     )
     return builder, booster
@@ -157,7 +231,7 @@ def tune(
     n_folds: int = 3,
     valid_ratio: float = 0.15,
 ) -> TuningResult:
-    """時系列 CV の平均 logloss を最小化するハイパーパラメータを Optuna で探す."""
+    """時系列 CV の平均 (レース単位の) logloss を最小化するハイパーパラメータを Optuna で探す."""
     folds = time_series_folds(train["race_date"], n_folds=n_folds, valid_ratio=valid_ratio)
 
     def objective(trial: optuna.Trial) -> float:
@@ -165,7 +239,7 @@ def tune(
         scores, iters = [], []
         for step, (tr_idx, va_idx) in enumerate(folds):
             _, booster = _fit_one(params, train.iloc[tr_idx], train.iloc[va_idx])
-            scores.append(booster.best_score["valid_0"]["binary_logloss"])
+            scores.append(booster.best_score["valid_0"][METRIC_NAME])
             iters.append(booster.best_iteration)
             trial.report(float(np.mean(scores)), step)
             if trial.should_prune():
@@ -198,7 +272,7 @@ def train_final(train: pd.DataFrame, params: dict, num_boost_round: int) -> tupl
 
 def evaluate(booster: lgb.Booster, builder: FeatureBuilder, test: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """テストデータでの評価指標と, 予測結果付きの DataFrame を返す."""
-    pred = predict_top3(test, booster, builder)
+    pred = predict_win(test, booster, builder)
     return evaluate_predictions(pred), pred
 
 
@@ -216,13 +290,15 @@ def save_artifacts(
 ) -> Path:
     """推論に必要なもの一式を保存する.
 
-    model.txt     : LightGBM のモデル
-    metadata.json : 前処理 (カテゴリの種類, 事前値, 特徴量の順番), パラメータ, 学習期間, 評価指標
+    model.txt     : LightGBM のモデル (出力は各馬の強さの対数. レース内でソフトマックスをとると 1 着の確率)
+    metadata.json : 目的変数, 前処理 (カテゴリの種類, 事前値, 特徴量の順番), パラメータ, 学習期間, 評価指標
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(output_dir / "model.txt"))
     metadata = {
+        "target": MODEL_TARGET,  # 推論側 (load_artifacts) はこれが "is_win" のモデルだけを使う
+        "objective": OBJECTIVE_NAME,
         "feature_builder": builder.to_dict(),
         "params": params,
         "num_boost_round": num_boost_round,

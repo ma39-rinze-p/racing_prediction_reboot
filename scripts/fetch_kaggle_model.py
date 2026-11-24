@@ -101,7 +101,7 @@ def print_summary() -> None:
     print(f"適用中のモデル: {active} (学習期間 {info.get('train_period')} / {info.get('n_train_races')} レース)")
     test = info.get("test_metrics", {})
     if test:
-        print(f"  テスト: ROC-AUC={test.get('roc_auc')} レース内AUC={test.get('roc_auc_by_race')} logloss={test.get('logloss')}")
+        print(f"  テスト: ROC-AUC={test.get('roc_auc')} レース内AUC={test.get('roc_auc_by_race')} logloss={test.get('logloss')} 単勝的中率={test.get('win_hit')}")
     print("一覧: python scripts/model_registry.py list / 1 つ前に戻す: rollback / ROC-AUC 最良に戻す: best")
     print("GitHub Actions で使うには commit & push してください:")
     print("  git add models && git commit -m \"update production model\" && git push")

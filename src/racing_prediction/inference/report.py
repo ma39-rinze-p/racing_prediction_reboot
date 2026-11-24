@@ -82,7 +82,7 @@ def format_race_report(
 
     Args:
         race_info: venue, race_number, race_name, course, start_time を持つ dict (時刻表の 1 行)
-        pred: predict_top3 の出力 (1 レース分)
+        pred: predict_win の出力 (1 レース分) に, シミュレーションした 3 着以内の確率 p_top3 を加えたもの
         wide: wide_probabilities の出力
         boxes: 期待値がプラスのボックス (all_box_expected_values + add_box_hit_rates. オッズが取れなかったときは None)
         n_boxes_total: 期待値を計算したボックスの総数
@@ -121,12 +121,13 @@ def format_race_report(
     if boxes is not None and odds_note:
         lines += [f"※ オッズは {odds_note}. 締切までに変わります", ""]
 
-    lines.append("■ 3着以内に入る確率")
+    lines.append("■ 1着になる確率 (カッコ内は3着以内に入る確率)")
     for _, h in pred.sort_values("pred_rank").iterrows():
         weight = "" if pd.isna(h["horse_weight"]) else f" {int(h['horse_weight'])}kg"
         if weight and pd.notna(h["weight_diff"]):
             weight += f"({int(h['weight_diff']):+d})"
-        lines.append(f"{int(h['pred_rank']):>2}. {circled(int(h['umaban']))} {h['horse_name']} {h['p_top3']:.0%}{weight}")
+        top3 = f" ({h['p_top3']:.0%})" if "p_top3" in h and pd.notna(h["p_top3"]) else ""
+        lines.append(f"{int(h['pred_rank']):>2}. {circled(int(h['umaban']))} {h['horse_name']} {h['p_win']:.1%}{top3}{weight}")
 
     lines += ["", f"■ ワイド的中確率 (上位{n_wide})"]
     for _, w in wide.head(n_wide).iterrows():
@@ -137,6 +138,8 @@ def format_race_report(
         "※ ボックスの期待払戻 = 含まれる各組の (確率 × 最低オッズ × 100円) の合計. 確率はモデルの確率と",
         "  オッズから逆算した市場の確率を組み合わせたもの (オッズ50倍超・モデル確率5%未満の組は市場の確率のみ.",
         "  configs/betting.yaml). 的中率はボックス内の2頭以上が3着以内に入る確率 (モデル).",
+        "※ モデルは各馬が1着になる確率を予測する (レース内の合計は100%). 3着以内・ワイドの確率は,",
+        "  1着の確率を各馬の強さとして着順をシミュレーションして求めたもの.",
         "※ 予測は参考情報であり, 馬券の的中・利益を保証するものではありません.",
         *( [f"※ モデル: {model_version}"] if model_version else [] ),
     ]

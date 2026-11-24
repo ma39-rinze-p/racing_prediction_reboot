@@ -6,7 +6,8 @@
     models/production/       今適用しているバージョンのコピー (推論はここを読む) + VERSION.txt (バージョン番号)
 
 適用するモデルの選び方 (registry.json の "policy"):
-    "best"   (既定・自動モード): 登録済みの全バージョンのうち, テストの ROC-AUC が最も高いものを適用する.
+    "best"   (既定・自動モード): 1 着の確率を予測するモデル (目的変数 is_win) のうち, テストの ROC-AUC が最も高いものを適用する.
+             (以前の 3 着以内を予測するモデルは, ROC-AUC の意味が違い推論にも使えないため選ばない)
              新しいモデルを取り込むたび (scripts/train_on_kaggle.py / fetch_kaggle_model.py から自動で呼ばれる) に選び直す.
     "manual" (手動モード)     : promote / rollback で選んだバージョンに固定する (新しいモデルを取り込んでも切り替えない).
              best コマンドで自動モードに戻る.
@@ -40,6 +41,10 @@ REQUIRED_FILES = ["model.txt", "metadata.json"]
 
 # 最良のモデルを選ぶ指標 (各モデルを学習したときのテスト期間の ROC-AUC. 大きいほど良い)
 PRIMARY_METRIC = "roc_auc"
+# 推論で使えるモデルの目的変数 (racing_prediction.models.predict_model.MODEL_TARGET と揃える).
+# metadata.json に target がないモデルは, 1 着モデル導入前の 3 着以内モデル (is_top3)
+MODEL_TARGET = "is_win"
+LEGACY_TARGET = "is_top3"
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +60,15 @@ def _summary(model_dir: Path) -> dict:
     metrics = meta.get("metrics", {})
     test = metrics.get("test", {})
     return {
+        "target": meta.get("target", LEGACY_TARGET),
         "train_period": meta.get("train_period"),
         "n_train_races": meta.get("n_train_races"),
         "test_period": metrics.get("test_period"),
-        "test_metrics": {k: test.get(k) for k in ("roc_auc_by_race", "roc_auc", "logloss", "top3_precision", "wide_top_pair_hit") if k in test},
+        "test_metrics": {
+            k: test.get(k)
+            for k in ("roc_auc_by_race", "roc_auc", "logloss", "win_hit", "top3_precision", "wide_top_pair_hit")
+            if k in test
+        },
     }
 
 
@@ -110,10 +120,15 @@ def _next_version(registry: dict) -> str:
 # ---------------------------------------------------------------------------
 # 操作
 # ---------------------------------------------------------------------------
+def _target(info: dict) -> str:
+    return info.get("target", LEGACY_TARGET)
+
+
 def best_version(registry: dict) -> str | None:
-    """テストの ROC-AUC が最も高いバージョン (同じなら新しい方). 指標がないバージョンは対象外."""
+    """1 着モデル (is_win) のうち, テストの ROC-AUC が最も高いバージョン (同じなら新しい方).
+    指標がないバージョンと, 3 着以内モデル (ROC-AUC の意味が違い, 推論にも使えない) は対象外."""
     scored = [(info["test_metrics"].get(PRIMARY_METRIC), v) for v, info in registry["versions"].items()
-              if info.get("test_metrics", {}).get(PRIMARY_METRIC) is not None]
+              if _target(info) == MODEL_TARGET and info.get("test_metrics", {}).get(PRIMARY_METRIC) is not None]
     return max(scored)[1] if scored else None
 
 
@@ -122,7 +137,7 @@ def apply_best(reason: str) -> None:
     registry = load_registry()
     best = best_version(registry)
     if best is None:
-        print(f"テストの {PRIMARY_METRIC} が記録されたバージョンがないため, 適用するモデルを選べません")
+        print(f"テストの {PRIMARY_METRIC} が記録された 1 着モデル ({MODEL_TARGET}) がないため, 適用するモデルを選べません")
         return
     score = registry["versions"][best]["test_metrics"][PRIMARY_METRIC]
     if best == registry["active"]:
@@ -176,6 +191,12 @@ def promote(version: str, reason: str = "手動で適用", is_rollback: bool = F
     registry = load_registry()
     if version not in registry["versions"]:
         raise SystemExit(f"{version} は登録されていません (登録済み: {', '.join(sorted(registry['versions']))})")
+    target = _target(registry["versions"][version])
+    if target != MODEL_TARGET:
+        raise SystemExit(
+            f"{version} は目的変数が {target} のモデル (3 着以内を予測する以前のモデル) のため, 今の推論では使えません. "
+            f"1 着の確率を予測するモデル ({MODEL_TARGET}) を選んでください"
+        )
     _copy_model(REGISTRY_DIR / version, PRODUCTION_DIR)
     _write_version_file(version)
     previous = registry["active"]
@@ -219,10 +240,13 @@ def list_versions() -> None:
         mark = ("*" if version == registry["active"] else " ") + ("★" if version == best else " ") + " "
         period = "〜".join(info.get("train_period") or ["?", "?"])
         test_period = "〜".join(info.get("test_period") or ["?", "?"])
+        if _target(info) != MODEL_TARGET:
+            mark = mark[:2] + "×"  # 3 着以内モデル (推論に使えない. 指標も 1 着モデルとは比べられない)
         roc = f"{m['roc_auc']:.4f}" if m.get("roc_auc") is not None else "-"
         auc = f"{m['roc_auc_by_race']:.4f}" if m.get("roc_auc_by_race") is not None else "-"
         ll = f"{m['logloss']:.4f}" if m.get("logloss") is not None else "-"
         print(f"{mark}{version:<8} {info.get('registered_at', ''):<20} {period:<25} {info.get('n_train_races') or '-':>6}  {roc:>8}  {auc:>10}  {ll:>7}  {test_period}")
+    print("\n* 適用中 / ★ ROC-AUC 最良 / × 3 着以内を予測する以前のモデル (推論に使えないため適用できない)")
     print("\n適用の履歴 (新しい順):")
     for h in reversed(registry["history"][-10:]):
         print(f"  {h['activated_at']}  {h['version']}  {h.get('reason', '')}")

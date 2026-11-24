@@ -45,7 +45,7 @@ from racing_prediction.data.race_list import fetch_race_schedule, venue_code
 from racing_prediction.data.scrape_odds import fetch_wide_odds
 from racing_prediction.inference.notify import notify
 from racing_prediction.inference.report import format_race_report
-from racing_prediction.models.predict_model import load_artifacts, predict_top3, simulate_top3, wide_probabilities
+from racing_prediction.models.predict_model import load_artifacts, predict_win, simulate_top3, wide_probabilities
 
 JST = ZoneInfo("Asia/Tokyo")
 DEFAULT_MODEL_DIR = "models/production"
@@ -55,7 +55,7 @@ DEFAULT_BETTING_CONFIG = "configs/betting.yaml"
 # 状態ファイルに保存する予測結果の列 (メールの作成に使う)
 PRED_COLUMNS = [
     "race_id", "race_date", "race_venue", "race_surface", "race_track_condition", "n_horses",
-    "umaban", "horse_name", "p_top3", "pred_rank", "horse_weight", "weight_diff",
+    "umaban", "horse_name", "p_win", "pred_rank", "horse_weight", "weight_diff",
 ]
 
 
@@ -195,7 +195,7 @@ def predict_race(race_info: dict, booster, builder) -> tuple[dict, pd.DataFrame]
     """1 レースの出馬表・戦績・血統を取得して予測する. (補ったレース情報, 予測結果) を返す."""
     table = build_race_table(race_info["race_id"])
     race_info = complete_race_info(race_info, table)
-    pred = predict_top3(table, booster, builder).reset_index(drop=True)
+    pred = predict_win(table, booster, builder).reset_index(drop=True)
     return race_info, pred
 
 
@@ -228,7 +228,10 @@ def build_report(
 
     オッズが取れなくても, 予測だけで通知文を作る.
     """
+    pred = pred.reset_index(drop=True)
+    # 1 着の確率 (p_win) から着順をシミュレーションし, 3 着以内の確率とワイドの確率を出す
     in_top = simulate_top3(pred)  # 乱数の種が固定なので, 同じ予測からは同じ結果になる
+    pred = pred.assign(p_top3=in_top.mean(axis=0))
     wide = wide_probabilities(pred, in_top=in_top)
     boxes = n_boxes_total = None
     try:

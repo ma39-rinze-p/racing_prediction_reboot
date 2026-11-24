@@ -13,8 +13,9 @@ netkeiba から取得した出馬表・結果・過去戦績・血統をもと�
     識別用   : race_id, race_date, umaban, horse_name (馬名は過学習を防ぐため特徴量にしない)
     特徴量   : レースの場所・距離区分・芝/ダート・馬場状態・出走頭数, 馬ごとの情報 (枠番含む),
                条件別の平均着順と出走回数, 血統 (ID なし)
-    目的変数 : is_top3 (3 着以内なら 1, それ以外は 0. 結果未確定のレースは欠損)
-    参考     : rank (着順)
+    目的変数 : is_win (1 着なら 1, それ以外は 0. 結果未確定のレースは欠損)
+               CSV には保存せず, 読み込み時に着順 (rank) から作る (add_win_label)
+    参考     : rank (着順), is_top3 (3 着以内なら 1. ワイドの評価に使う. CSV に保存する)
     馬券用   : win_odds (確定単勝オッズ), popularity (人気)
                レース後に確定する値なので特徴量には使わない (リーク). 馬券購入の最適化に使う
 """
@@ -61,7 +62,10 @@ HORSE_FEATURE_COLUMNS = [
 
 PEDIGREE_FEATURE_COLUMNS = ["sire", "sire_line", "dam", "sire_sire", "sire_dam", "dam_sire", "dam_dam"]
 
-TARGET_COLUMN = "is_top3"
+# モデルの目的変数 (1 着か否か). CSV には保存せず, 着順から作る (保存済みの CSV をそのまま使えるようにするため)
+TARGET_COLUMN = "is_win"
+# 3 着以内か否か (CSV に保存する. ワイドの評価に使う)
+TOP3_COLUMN = "is_top3"
 
 # 特徴量には入れない列 (着順と, 馬券購入の最適化に使う確定オッズ・人気)
 RESULT_COLUMNS = ["rank", "win_odds", "popularity"]
@@ -93,23 +97,35 @@ def build_race_table(race_id: str) -> pd.DataFrame:
 
     df["race_distance_category"] = df["race_distance"].map(distance_category)
 
-    # 取消・除外の馬は出走していないので除く (中止・失格は出走扱いで is_top3 = 0)
+    # 取消・除外の馬は出走していないので除く (中止・失格は出走扱いで is_top3 = is_win = 0)
     not_started = df["is_canceled"] | df["rank_text"].isin(NOT_STARTED)
     df = df[~not_started].copy()
     df["n_horses"] = len(df)
 
     result_fixed = df["rank_text"].notna().any()
     if result_fixed:
-        df[TARGET_COLUMN] = (df["rank"] <= 3).fillna(False).astype("Int64")
+        df[TOP3_COLUMN] = (df["rank"] <= 3).fillna(False).astype("Int64")
     else:
-        df[TARGET_COLUMN] = pd.array([pd.NA] * len(df), dtype="Int64")
+        df[TOP3_COLUMN] = pd.array([pd.NA] * len(df), dtype="Int64")
 
-    return df[output_columns()].reset_index(drop=True)
+    return add_win_label(df[output_columns()].reset_index(drop=True))
+
+
+def add_win_label(df: pd.DataFrame) -> pd.DataFrame:
+    """目的変数 is_win (1 着なら 1) を着順から作って追加する. 結果未確定 (is_top3 が欠損) の行は欠損.
+
+    同着の場合は 1 着の馬が複数になる (どちらも 1).
+    """
+    df = df.copy()
+    rank = pd.to_numeric(df["rank"], errors="coerce")
+    win = (rank == 1).astype("Int64")
+    df[TARGET_COLUMN] = win.where(df[TOP3_COLUMN].notna(), pd.NA).astype("Int64")
+    return df
 
 
 def output_columns() -> list[str]:
     """CSV に保存する列の順番."""
-    return ID_COLUMNS + feature_columns() + [TARGET_COLUMN] + RESULT_COLUMNS
+    return ID_COLUMNS + feature_columns() + [TOP3_COLUMN] + RESULT_COLUMNS
 
 
 def make_dataset(race_ids: list[str], output_path: str | Path) -> pd.DataFrame:

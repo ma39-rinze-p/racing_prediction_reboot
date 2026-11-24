@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from racing_prediction.data.make_dataset import TARGET_COLUMN, feature_columns, output_columns
+from racing_prediction.data.make_dataset import TARGET_COLUMN, add_win_label, feature_columns, output_columns
 from racing_prediction.features.build_features import VENUES
 
 # LightGBM のカテゴリ変数として扱う列
@@ -81,7 +81,7 @@ def load_race_csvs(races_dir: str | Path) -> pd.DataFrame:
     if not tables:
         raise ValueError("読み込める CSV がありませんでした")
 
-    df = pd.concat(tables, ignore_index=True)
+    df = add_win_label(pd.concat(tables, ignore_index=True))  # 目的変数 is_win (1 着か) を着順から作る
     return df.sort_values(["race_date", "race_id", "umaban"], ignore_index=True)
 
 
@@ -196,5 +196,5 @@ class FeatureBuilder:
 
 
 def labeled(df: pd.DataFrame) -> pd.DataFrame:
-    """目的変数 (is_top3) が入っている行 = 結果確定済みのレースだけを返す."""
+    """目的変数 (is_win) が入っている行 = 結果確定済みのレースだけを返す."""
     return df[df[TARGET_COLUMN].notna()].reset_index(drop=True)
