@@ -1,0 +1,122 @@
+{
+  "config": {
+    "start_date": null,
+    "end_date": "2026-11-28",
+    "venues": null,
+    "test_ratio": 0.2,
+    "n_trials": 150,
+    "timeout_sec": 14400,
+    "n_folds": 3,
+    "market_offset": true
+  },
+  "data_period": [
+    "2024-01-06",
+    "2026-11-28"
+  ],
+  "train_period": [
+    "2024-01-06",
+    "2026-05-03"
+  ],
+  "test_period": [
+    "2026-05-09",
+    "2026-11-28"
+  ],
+  "n_races": {
+    "train": 8091,
+    "test": 1954
+  },
+  "cv_logloss": 1.9331102746564726,
+  "num_boost_round": 52,
+  "best_params": {
+    "objective": "race_softmax",
+    "metric": "None",
+    "learning_rate": 0.05,
+    "bagging_freq": 1,
+    "verbosity": -1,
+    "seed": 42,
+    "deterministic": true,
+    "force_col_wise": true,
+    "num_leaves": 9,
+    "min_child_samples": 96,
+    "feature_fraction": 0.8115645762907531,
+    "bagging_fraction": 0.6973641161407451,
+    "lambda_l1": 0.029288435506073157,
+    "lambda_l2": 9.149579629615458
+  },
+  "test_metrics": {
+    "model": {
+      "n_races": 1954,
+      "n_rows": 26308,
+      "roc_auc": 0.838461154431662,
+      "roc_auc_by_race": 0.8194550303557467,
+      "logloss": 1.9005180728957014,
+      "brier": 0.058369327464135534,
+      "win_hit": 0.34953940634595704,
+      "winner_in_top3": 0.6606960081883316,
+      "top3_precision": 0.5276356192425793,
+      "wide_top_pair_hit": 0.33162743091095187
+    },
+    "odds_baseline": {
+      "n_races": 1954,
+      "n_rows": 26308,
+      "roc_auc": 0.8383897956085121,
+      "roc_auc_by_race": 0.8198848891707432,
+      "logloss": 1.9016432007539228,
+      "brier": 0.05842786082913626,
+      "win_hit": 0.34800409416581374,
+      "winner_in_top3": 0.6606960081883316,
+      "top3_precision": 0.5283179802115319,
+      "wide_top_pair_hit": 0.33418628454452404
+    }
+  },
+  "market_offset": true,
+  "test_market_blend": {
+    "n_races": 1954,
+    "model_weight": 0.6589373834530757,
+    "market_weight": 0.38312506283272973,
+    "model_weight_p_value": 0.003430627789158495,
+    "market_logloss": 1.9013861874727935,
+    "raw_market_logloss": 1.9016432007539228,
+    "calibrated_market_logloss": 1.9013861874727935,
+    "model_logloss": 1.9005180728957014,
+    "blend_logloss": 1.9051698746669177,
+    "logloss_gain": -0.0037836871941242496,
+    "logloss_gain_ci_low": -0.007923376289156417,
+    "logloss_gain_ci_high": 0.0003283075490483128,
+    "model_gain": 0.0008681145770922315,
+    "model_gain_ci_low": -0.003612460672059389,
+    "model_gain_ci_high": 0.005511767755352695,
+    "market_hit": 0.34851586489252817,
+    "model_hit": 0.34953940634595704,
+    "blend_hit": 0.3526100307062436,
+    "blend_hit_diff": 0.004094165813715411,
+    "value_threshold": 1.0,
+    "n_value_bets": 233,
+    "value_bet_return": 1.012017167381974,
+    "goal_met": false
+  },
+  "test_top_pick": {
+    "n_races": 1954,
+    "model_hit": 0.34953940634595704,
+    "favorite_hit": 0.34851586489252817,
+    "diff": 0.0010235414534288667,
+    "diff_ci_low": -0.007164790174002067,
+    "diff_ci_high": 0.00922466734902759,
+    "p_value": 0.9049745264594622,
+    "same_rate": 0.9298874104401228,
+    "n_model_only": 36,
+    "n_favorite_only": 34,
+    "hit_when_same": 0.35608145294441385,
+    "model_hit_when_diff": 0.26277372262773724,
+    "favorite_hit_when_diff": 0.24817518248175183,
+    "bet_per_race": 100,
+    "model_profit": -35580.0,
+    "favorite_profit": -36650.0,
+    "model_return": 0.8179119754350052,
+    "favorite_return": 0.8124360286591608,
+    "return_diff": 0.005475946775844421,
+    "return_diff_ci_low": -0.023849795291709403,
+    "return_diff_ci_high": 0.03526228249744113
+  },
+  "n_unused_features": 66
+}

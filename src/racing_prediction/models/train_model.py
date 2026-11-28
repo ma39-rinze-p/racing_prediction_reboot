@@ -1,33 +1,65 @@
 """train_model
 
-LightGBM (二値分類: 3 着以内か否か) の学習.
+LightGBM で各馬が 1 着になる確率を予測するモデル (条件付きロジット / レース内ソフトマックス) の学習.
+
+モデル:
+    LightGBM が各馬の強さの対数 (win_score) を出力し, レース内でソフトマックスをとって 1 着の確率にする.
+        p_win(i) = exp(win_score(i)) / Σ_{同じレースの馬 j} exp(win_score(j))
+    → レースごとの確率の合計は必ず 1 になる. 学習では「1 着の馬に付けた確率の -log」(レース単位の logloss) を
+      最小化する (ソフトマックス交差エントロピー. LightGBM のカスタム目的関数で実装).
+    同着で 1 着が複数いるレースは, 正解を 1 着の馬で等分する (例: 2 頭なら 0.5 ずつ).
 
 方針:
     - 検証は必ず時系列で行う (学習 = 過去, 検証 = その後). 1 レースの馬は同じ側に入れる.
-    - Optuna は「テスト期間より前」のデータだけで, 期間をずらした時系列 CV の logloss を最小化する.
+    - Optuna は「テスト期間より前」のデータだけで, 期間をずらした時系列 CV のレース単位の logloss を最小化する.
     - カテゴリの種類などの前処理も fold ごとに学習側だけで fit する (リーク防止).
+
+高速化:
+    - 前処理 (FeatureBuilder) と LightGBM の Dataset (特徴量のビン分け) は, fold ごとに 1 回だけ作り,
+      Optuna の全試行で使い回す (前処理はハイパーパラメータに依存しないため).
+      Dataset を使い回せるよう feature_pre_filter=False にする (min_child_samples を試行ごとに変えるため).
+    - 目的関数・評価指標で使うレースの区切りと正解は, Dataset ごとに 1 回だけ計算して使い回す.
+
+オッズとの差だけを学習する (market_offset=True):
+    単勝オッズから逆算した確率の対数を, 各馬のスコアの出発点 (LightGBM の init_score) にする.
+        win_score(i) = log(オッズの確率(i)) + モデルの出力(i)
+    木はオッズで説明できない部分 (オッズの外れ方) だけを学習する. オッズは特徴量に入れないので,
+    オッズを真似るだけのモデルにはならない. 予測時は predict_model.predict_win が同じ値を足す.
+    学習には確定オッズを使い, 推論では発走前 (発走 12 分前) のオッズを使う.
+
+3 着以内に入る確率のモデル (task="top3"):
+    各馬が 3 着以内に入るか (is_top3) を予測する二値分類 (LightGBM の binary. 出力はロジット).
+    1 着のモデルと同じ特徴量・同じ時系列 CV で, 別にハイパーパラメータを探す.
+    オッズとの差だけを学習する場合は, 単勝オッズの確率から Harville モデルで計算した 3 着以内の確率の
+    ロジットを出発点にする (predict_model.market_top3_logit). 複勝・ワイド・3 連複・3 連単の予測に使う.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
 
-from racing_prediction.data.make_dataset import TARGET_COLUMN
+from racing_prediction.data.make_dataset import TARGET_COLUMN, TOP3_COLUMN
 from racing_prediction.features.model_features import FeatureBuilder
-from racing_prediction.models.predict_model import evaluate_predictions, predict_top3
+from racing_prediction.models.predict_model import (
+    MODEL_TARGET, PROB_FLOOR, TOP3_MODEL_TARGET, evaluate_predictions, evaluate_top3, market_log_prob,
+    market_top3_logit, predict_top3, predict_win)
 
 SEED = 42
+OBJECTIVE_NAME = "race_softmax"  # レース内ソフトマックス交差エントロピー (カスタム目的関数. 保存する params での名前)
+METRIC_NAME = "race_logloss"
 
 BASE_PARAMS = {
-    "objective": "binary",
-    "metric": "binary_logloss",
+    "objective": OBJECTIVE_NAME,  # 学習時に race_softmax_objective に置き換える
+    "metric": "None",  # 評価指標はカスタム (race_logloss_metric)
     "learning_rate": 0.05,
     "bagging_freq": 1,
     "verbosity": -1,
@@ -35,6 +67,17 @@ BASE_PARAMS = {
     "deterministic": True,
     "force_col_wise": True,
 }
+
+# 学習データでの出現回数がこれ未満のカテゴリは "__other__" にまとめる. 今のカテゴリ変数 (競馬場・芝ダ・性別・父の系統など)
+# は種類が少ないので探索せず固定にする (前処理を試行ごとに作り直さずに済む)
+MIN_CATEGORY_COUNT = 5
+
+# 3 着以内のモデル (二値分類) のパラメータ. 探索するパラメータは 1 着のモデルと同じ
+TOP3_OBJECTIVE = "binary"
+TOP3_METRIC = "binary_logloss"
+TOP3_BASE_PARAMS = {**{k: v for k, v in BASE_PARAMS.items() if k not in ("objective", "metric")},
+                    "objective": TOP3_OBJECTIVE, "metric": TOP3_METRIC}
+TASKS = ("win", "top3")
 
 EARLY_STOPPING_ROUNDS = 100
 MAX_BOOST_ROUND = 5000
@@ -57,6 +100,17 @@ def filter_period(
     out = df[mask].reset_index(drop=True)
     if out.empty:
         raise ValueError(f"{start_date} 〜 {end_date} に該当するレースがありません")
+    return out
+
+
+def filter_venues(df: pd.DataFrame, venues: list[str] | tuple[str, ...] | None = None) -> pd.DataFrame:
+    """競馬場 (race_venue) が venues のどれかのレースだけに絞る. None や空なら全競馬場を使う."""
+    if not venues:
+        return df.reset_index(drop=True)
+    out = df[df["race_venue"].isin(list(venues))].reset_index(drop=True)
+    if out.empty:
+        found = sorted(df["race_venue"].dropna().unique())
+        raise ValueError(f"競馬場 {list(venues)} のレースがありません (データにある競馬場: {found})")
     return out
 
 
@@ -102,43 +156,182 @@ def time_series_folds(dates: pd.Series, n_folds: int = 3, valid_ratio: float = 0
 
 
 # ---------------------------------------------------------------------------
+# レース内ソフトマックス (条件付きロジット) の目的関数・評価指標
+# ---------------------------------------------------------------------------
+def _race_targets(label: np.ndarray, group: np.ndarray) -> np.ndarray:
+    """正解 (1 着なら 1) をレース内で合計 1 にする (同着なら 1 着の馬で等分)."""
+    starts = np.concatenate([[0], np.cumsum(group)[:-1]])
+    gid = np.repeat(np.arange(len(group)), group)
+    total = np.add.reduceat(label, starts)[gid]
+    return np.divide(label, total, out=np.zeros_like(label, dtype=float), where=total > 0)
+
+
+def _race_cache(data: lgb.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dataset のレースの区切り (各レースの先頭行, 各行のレース番号) と正解 (レース内で合計 1) .
+
+    ブースティングの毎回の反復で同じ計算をしないよう, Dataset に保存して使い回す.
+    """
+    cache = getattr(data, "_race_cache", None)
+    if cache is None:
+        group = data.get_group().astype(int)
+        starts = np.concatenate([[0], np.cumsum(group)[:-1]])
+        gid = np.repeat(np.arange(len(group)), group)
+        y = _race_targets(data.get_label().astype(float), group)
+        cache = (starts, gid, y)
+        data._race_cache = cache
+    return cache
+
+
+def _softmax_cached(preds: np.ndarray, starts: np.ndarray, gid: np.ndarray) -> np.ndarray:
+    e = np.exp(preds - np.maximum.reduceat(preds, starts)[gid])
+    return e / np.add.reduceat(e, starts)[gid]
+
+
+def race_softmax_objective(preds: np.ndarray, data: lgb.Dataset) -> tuple[np.ndarray, np.ndarray]:
+    """レース内ソフトマックス交差エントロピーの勾配とヘッセ行列の対角 (LightGBM のカスタム目的関数)."""
+    starts, gid, y = _race_cache(data)
+    p = _softmax_cached(preds, starts, gid)
+    return p - y, np.maximum(p * (1 - p), 1e-6)
+
+
+def race_logloss_metric(preds: np.ndarray, data: lgb.Dataset) -> tuple[str, float, bool]:
+    """レース単位の logloss (1 着の馬に付けた確率の -log の平均) (LightGBM のカスタム評価指標)."""
+    starts, gid, y = _race_cache(data)
+    p = _softmax_cached(preds, starts, gid)
+    p_winner = np.add.reduceat(p * (y > 0), starts)
+    return METRIC_NAME, float(-np.log(np.clip(p_winner, PROB_FLOOR, None)).mean()), False
+
+
+def _prepare(df: pd.DataFrame) -> pd.DataFrame:
+    """学習に使えるレースだけにして, 同じレースの馬が連続して並ぶよう並べ替える.
+
+    1 着の馬がいないレース (全頭が中止など) は正解がないので除く.
+    """
+    df = df[df[TARGET_COLUMN].notna()]
+    has_winner = df[TARGET_COLUMN].astype(int).groupby(df["race_id"]).transform("sum") > 0
+    return df[has_winner].sort_values(["race_date", "race_id", "umaban"], kind="stable").reset_index(drop=True)
+
+
+# Dataset を作るときの設定. feature_pre_filter=False なら, 作った Dataset を min_child_samples の違う学習にも使い回せる
+DATASET_PARAMS = {"feature_pre_filter": False, "verbosity": -1}
+
+
+def _dataset(
+    df: pd.DataFrame, builder: FeatureBuilder, reference: lgb.Dataset | None = None, task: str = "win"
+) -> lgb.Dataset:
+    """LightGBM の Dataset. builder.market_offset なら, 単勝オッズから計算した値を init_score (出発点) にする.
+
+    task="win" : 正解は 1 着か. 出発点は単勝オッズの確率の対数. レースの区切り (group) を持たせる
+    task="top3": 正解は 3 着以内か. 出発点は単勝オッズから計算した 3 着以内の確率のロジット
+    カスタム目的関数・評価指標に渡されるスコアには init_score が含まれる (出発点 + 木の出力).
+    """
+    if task == "top3":
+        init_score = market_top3_logit(df) if builder.market_offset else None
+        return lgb.Dataset(
+            builder.transform(df), label=df[TOP3_COLUMN].astype(int).to_numpy(), init_score=init_score,
+            reference=reference, free_raw_data=False, params=DATASET_PARAMS,
+        )
+    group = df.groupby("race_id", sort=False).size().to_numpy()
+    init_score = market_log_prob(df) if builder.market_offset else None
+    return lgb.Dataset(
+        builder.transform(df), label=df[TARGET_COLUMN].astype(int).to_numpy(), group=group, init_score=init_score,
+        reference=reference, free_raw_data=False, params=DATASET_PARAMS,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 学習
 # ---------------------------------------------------------------------------
-def _fit_one(params: dict, train: pd.DataFrame, valid: pd.DataFrame | None = None, num_boost_round: int | None = None):
-    """前処理の fit + LightGBM の学習. valid があれば early stopping する."""
-    builder = FeatureBuilder(min_category_count=params.get("min_category_count", 5)).fit(train)
+def _lgb_params(params: dict) -> dict:
+    """保存用の params を LightGBM に渡す形にする (1 着のモデルはカスタム目的関数を関数に置き換える.
+    3 着以内のモデル (objective="binary") はそのまま)."""
     lgb_params = {k: v for k, v in params.items() if k != "min_category_count"}
+    if params.get("objective", OBJECTIVE_NAME) == OBJECTIVE_NAME:
+        lgb_params["objective"] = race_softmax_objective
+        lgb_params["metric"] = "None"
+    return lgb_params
 
-    dtrain = lgb.Dataset(builder.transform(train), label=train[TARGET_COLUMN].astype(int), free_raw_data=False)
-    if valid is None:
-        booster = lgb.train(lgb_params, dtrain, num_boost_round=num_boost_round)
-        return builder, booster
 
-    dvalid = lgb.Dataset(builder.transform(valid), label=valid[TARGET_COLUMN].astype(int), reference=dtrain)
-    booster = lgb.train(
+def _metric_name(params: dict) -> str:
+    return METRIC_NAME if params.get("objective", OBJECTIVE_NAME) == OBJECTIVE_NAME else TOP3_METRIC
+
+
+@dataclass
+class FoldData:
+    """前処理済みの学習・検証データ (fold ごとに 1 回だけ作り, Optuna の全試行で使い回す)."""
+
+    builder: FeatureBuilder
+    dtrain: lgb.Dataset
+    dvalid: lgb.Dataset | None
+    task: str = "win"
+
+
+def prepare_fold(
+    train: pd.DataFrame,
+    valid: pd.DataFrame | None = None,
+    min_category_count: int = MIN_CATEGORY_COUNT,
+    market_offset: bool = False,
+    task: str = "win",
+) -> FoldData:
+    """前処理の fit (学習側だけ) と, LightGBM の Dataset の作成 (ビン分けまで済ませる).
+
+    market_offset=True なら, オッズとの差だけを学習する (単勝オッズから計算した値を出発点にする).
+    task: "win" (1 着か) / "top3" (3 着以内か)
+    """
+    if task not in TASKS:
+        raise ValueError(f"task は {TASKS} のどれかにしてください: {task}")
+    train = _prepare(train)
+    builder = FeatureBuilder(min_category_count=min_category_count).fit(train)
+    builder.market_offset = market_offset
+    dtrain = _dataset(train, builder, task=task).construct()
+    dvalid = None if valid is None else _dataset(_prepare(valid), builder, reference=dtrain, task=task).construct()
+    return FoldData(builder, dtrain, dvalid, task)
+
+
+def _train_on(params: dict, fold: FoldData, num_boost_round: int | None = None) -> lgb.Booster:
+    """作成済みの Dataset で LightGBM を学習する. 検証データがあれば early stopping する."""
+    lgb_params = _lgb_params(params)
+    if fold.dvalid is None:
+        return lgb.train(lgb_params, fold.dtrain, num_boost_round=num_boost_round)
+    custom = callable(lgb_params["objective"])
+    return lgb.train(
         lgb_params,
-        dtrain,
+        fold.dtrain,
         num_boost_round=MAX_BOOST_ROUND,
-        valid_sets=[dvalid],
+        valid_sets=[fold.dvalid],
+        feval=race_logloss_metric if custom else None,
         callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
     )
-    return builder, booster
 
 
-def _suggest_params(trial: optuna.Trial) -> dict:
-    """探索するハイパーパラメータ. データが少ないうちは過学習を抑える方向に効くものを中心にする."""
+def _fit_one(
+    params: dict,
+    train: pd.DataFrame,
+    valid: pd.DataFrame | None = None,
+    num_boost_round: int | None = None,
+    market_offset: bool = False,
+):
+    """前処理の fit + LightGBM の学習. valid があれば early stopping する. params の objective でモデルの種類が決まる."""
+    task = "win" if params.get("objective", OBJECTIVE_NAME) == OBJECTIVE_NAME else "top3"
+    fold = prepare_fold(train, valid, params.get("min_category_count", MIN_CATEGORY_COUNT), market_offset, task)
+    return fold.builder, _train_on(params, fold, num_boost_round)
+
+
+def _suggest_params(trial: optuna.Trial, base: dict = BASE_PARAMS) -> dict:
+    """探索するハイパーパラメータ. 過学習を抑える方向に効くものを中心にする.
+
+    カテゴリ変数の設定 (min_data_per_group, cat_smooth, min_category_count) は, 種類の多い列 (騎手名など) を
+    勝率などに置き換えて種類の少ないカテゴリ変数だけになったため, 探索せず LightGBM の既定値・固定値を使う
+    (探索するパラメータが少ないほど, 同じ試行回数でよい値に早く近づく).
+    """
     return {
-        **BASE_PARAMS,
+        **base,
         "num_leaves": trial.suggest_int("num_leaves", 7, 127, log=True),
         "min_child_samples": trial.suggest_int("min_child_samples", 10, 200, log=True),
         "feature_fraction": trial.suggest_float("feature_fraction", 0.3, 1.0),
         "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
         "lambda_l1": trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
         "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True),
-        # カテゴリ変数 (騎手・調教師・血統など種類が多い) の過学習対策
-        "min_data_per_group": trial.suggest_int("min_data_per_group", 10, 200, log=True),
-        "cat_smooth": trial.suggest_float("cat_smooth", 1.0, 100.0, log=True),
-        "min_category_count": trial.suggest_int("min_category_count", 3, 30, log=True),
     }
 
 
@@ -156,16 +349,28 @@ def tune(
     timeout: int | None = None,
     n_folds: int = 3,
     valid_ratio: float = 0.15,
+    market_offset: bool = False,
+    task: str = "win",
 ) -> TuningResult:
-    """時系列 CV の平均 logloss を最小化するハイパーパラメータを Optuna で探す."""
+    """時系列 CV の平均 logloss を最小化するハイパーパラメータを Optuna で探す.
+
+    task="win": 1 着のモデル (レース単位の logloss) / task="top3": 3 着以内のモデル (各馬の二値の logloss)
+    market_offset=True なら, オッズとの差だけを学習するモデルとして探す.
+    """
+    base = TOP3_BASE_PARAMS if task == "top3" else BASE_PARAMS
     folds = time_series_folds(train["race_date"], n_folds=n_folds, valid_ratio=valid_ratio)
+    # 前処理と Dataset は fold ごとに 1 回だけ作る (全試行で同じ)
+    fold_data = [
+        prepare_fold(train.iloc[tr_idx], train.iloc[va_idx], market_offset=market_offset, task=task)
+        for tr_idx, va_idx in folds
+    ]
 
     def objective(trial: optuna.Trial) -> float:
-        params = _suggest_params(trial)
+        params = _suggest_params(trial, base)
         scores, iters = [], []
-        for step, (tr_idx, va_idx) in enumerate(folds):
-            _, booster = _fit_one(params, train.iloc[tr_idx], train.iloc[va_idx])
-            scores.append(booster.best_score["valid_0"]["binary_logloss"])
+        for step, fold in enumerate(fold_data):
+            booster = _train_on(params, fold)
+            scores.append(booster.best_score["valid_0"][_metric_name(params)])
             iters.append(booster.best_iteration)
             trial.report(float(np.mean(scores)), step)
             if trial.should_prune():
@@ -184,22 +389,30 @@ def tune(
     # 最終学習の木の本数: CV の best_iteration の平均. 学習データが増える分だけ少し多めにする
     num_boost_round = int(np.mean(best.user_attrs["best_iterations"]) * 1.1) + 1
     return TuningResult(
-        best_params={**BASE_PARAMS, **best.params},
+        best_params={**base, **best.params},
         best_score=best.value,
         num_boost_round=num_boost_round,
         study=study,
     )
 
 
-def train_final(train: pd.DataFrame, params: dict, num_boost_round: int) -> tuple[FeatureBuilder, lgb.Booster]:
+def train_final(
+    train: pd.DataFrame, params: dict, num_boost_round: int, market_offset: bool = False
+) -> tuple[FeatureBuilder, lgb.Booster]:
     """決めたパラメータ・木の本数で, 渡したデータ全体を使って学習する."""
-    return _fit_one(params, train, num_boost_round=num_boost_round)
+    return _fit_one(params, train, num_boost_round=num_boost_round, market_offset=market_offset)
 
 
 def evaluate(booster: lgb.Booster, builder: FeatureBuilder, test: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """テストデータでの評価指標と, 予測結果付きの DataFrame を返す."""
-    pred = predict_top3(test, booster, builder)
+    pred = predict_win(test, booster, builder)
     return evaluate_predictions(pred), pred
+
+
+def evaluate_top3_model(booster: lgb.Booster, builder: FeatureBuilder, test: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    """3 着以内のモデルの, テストデータでの評価指標と予測結果付きの DataFrame を返す."""
+    pred = predict_top3(test, booster, builder)
+    return evaluate_top3(pred), pred
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +429,19 @@ def save_artifacts(
 ) -> Path:
     """推論に必要なもの一式を保存する.
 
-    model.txt     : LightGBM のモデル
-    metadata.json : 前処理 (カテゴリの種類, 事前値, 特徴量の順番), パラメータ, 学習期間, 評価指標
+    model.txt     : LightGBM のモデル (出力は各馬の強さの対数. レース内でソフトマックスをとると 1 着の確率)
+    metadata.json : 目的変数, 前処理 (カテゴリの種類, 事前値, 特徴量の順番), パラメータ, 学習期間, 評価指標
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(output_dir / "model.txt"))
     metadata = {
+        # 学習した日時 (日本時間). モデルのバージョン名 (v{日付_時刻}) に使う (scripts/model_registry.py)
+        "trained_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds"),
+        "target": MODEL_TARGET,  # 推論側 (load_artifacts) はこれが "is_win" のモデルだけを使う
+        "objective": OBJECTIVE_NAME,
+        # True: オッズとの差だけを学習したモデル (推論に発走前の単勝オッズが必要)
+        "market_offset": bool(builder.market_offset),
         "feature_builder": builder.to_dict(),
         "params": params,
         "num_boost_round": num_boost_round,
@@ -233,4 +452,42 @@ def save_artifacts(
         "lightgbm_version": lgb.__version__,
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_dir
+
+
+TOP3_MODEL_FILE = "model_top3.txt"
+TOP3_METADATA_FILE = "metadata_top3.json"
+
+
+def save_top3_artifacts(
+    output_dir: str | Path,
+    booster: lgb.Booster,
+    builder: FeatureBuilder,
+    params: dict,
+    num_boost_round: int,
+    train: pd.DataFrame,
+    metrics: dict | None = None,
+) -> Path:
+    """3 着以内のモデルを, 1 着のモデルと同じフォルダに保存する (model_top3.txt, metadata_top3.json).
+
+    推論側 (predict_model.load_top3_artifacts) は, このファイルがあれば 3 着以内のモデルも使う.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    booster.save_model(str(output_dir / TOP3_MODEL_FILE))
+    metadata = {
+        "trained_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="seconds"),
+        "target": TOP3_MODEL_TARGET,
+        "objective": TOP3_OBJECTIVE,
+        "market_offset": bool(builder.market_offset),
+        "feature_builder": builder.to_dict(),
+        "params": params,
+        "num_boost_round": num_boost_round,
+        "train_period": [str(train["race_date"].min().date()), str(train["race_date"].max().date())],
+        "n_train_races": int(train["race_id"].nunique()),
+        "n_train_rows": int(len(train)),
+        "metrics": metrics or {},
+        "lightgbm_version": lgb.__version__,
+    }
+    (output_dir / TOP3_METADATA_FILE).write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return output_dir

@@ -1,8 +1,13 @@
 """発走 12 分前に推論を始め, その時点のオッズで期待値を計算して通知する. GitHub Actions で開催日に常駐して実行する.
 
 「発走 12 分前」(--odds-minutes-before で変更可. カンマ区切りで複数も可) になったら推論を始め
-(出馬表・馬体重・戦績・血統を取得して予測. 1 レース 1〜2 分), 続けてその時点のワイドのオッズで
-期待値プラスのワイド ボックスを計算し, メールを送る (1 レースにつき 1 通).
+(出馬表・馬体重・戦績・血統を取得して予測. 1 レース 1〜2 分), 続けてその時点の単勝・複勝・ワイド・3 連複・3 連単の
+オッズを取得して, 各券種で「期待値がプラスかつ的中率が 10% 以上」の買い方 (1 点・ボックス・ながし・フォーメーション) を
+計算し, メールを送る (1 レースにつき 1 通. 券種・条件は configs/betting.yaml).
+
+オッズとの差を学習したモデル (metadata.json の market_offset が true) では, 推論のたびにその時点の単勝オッズを
+取得し, オッズから逆算した確率を出発点にして予測する (オッズは特徴量には入れない). 発売中のオッズが取れなければ
+その回の推論は失敗扱いにして, --retry 回まで試す. オッズを使わないモデルでは, オッズはワイドの期待値の計算にだけ使う.
 
 1 回の実行でやること:
     1. その日の時刻表を取得 (初回のみ. 以降は状態ファイルに保存したものを使う)
@@ -16,7 +21,7 @@
 使い方:
     python -m racing_prediction.inference.run                      # 通常 (今の時刻で判定)
     python -m racing_prediction.inference.run --dry-run --no-wait  # 通知せず・待たずに本文を表示
-    python -m racing_prediction.inference.run --race-id 202605050611 --dry-run   # 時刻に関係なく今のオッズで予測
+    python -m racing_prediction.inference.run --race-id 202605050611 --dry-run   # 時刻に関係なく予測して今のオッズで計算
     python -m racing_prediction.inference.run --venues 東京,京都 --race-numbers 7-12 --odds-minutes-before 12
     python -m racing_prediction.inference.run --prepare-only       # 時刻表を取得して, 対象レースがある日かだけ判定する
                                                                    # (GITHUB_OUTPUT に race_day=true/false を書く)
@@ -38,14 +43,15 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from racing_prediction.betting.optimize_bet import add_box_hit_rates, all_box_expected_values, wide_expected_values
+from racing_prediction.betting.strategies import build_portfolio, recommend_bets
 from racing_prediction.config import BettingConfig, load_betting_config
 from racing_prediction.data.make_dataset import build_race_table
 from racing_prediction.data.race_list import fetch_race_schedule, venue_code
-from racing_prediction.data.scrape_odds import fetch_wide_odds
+from racing_prediction.data.scrape_odds import LIVE_ODDS_STATUSES, fetch_bet_odds, fetch_win_odds
 from racing_prediction.inference.notify import notify
 from racing_prediction.inference.report import format_race_report
-from racing_prediction.models.predict_model import load_artifacts, predict_top3, simulate_top3, wide_probabilities
+from racing_prediction.models.predict_model import (
+    load_artifacts, load_top3_artifacts, orders_to_in_top, predict_top3, predict_win, simulate_orders, wide_probabilities)
 
 JST = ZoneInfo("Asia/Tokyo")
 DEFAULT_MODEL_DIR = "models/production"
@@ -55,8 +61,15 @@ DEFAULT_BETTING_CONFIG = "configs/betting.yaml"
 # 状態ファイルに保存する予測結果の列 (メールの作成に使う)
 PRED_COLUMNS = [
     "race_id", "race_date", "race_venue", "race_surface", "race_track_condition", "n_horses",
-    "umaban", "horse_name", "p_top3", "pred_rank", "horse_weight", "weight_diff",
+    "umaban", "horse_name", "p_win", "pred_rank", "horse_weight", "weight_diff",
+    "p_top3_model",  # 3 着以内のモデルの確率 (モデルがなければ欠損)
 ]
+
+ODDS_STATUS_JA = {"middle": "発売中", "result": "確定", "yoso": "発売前の予想オッズ"}
+
+
+class OddsNotAvailable(RuntimeError):
+    """推論に使える単勝オッズがまだない (発売前など)."""
 
 
 def now_jst() -> pd.Timestamp:
@@ -104,7 +117,7 @@ def pred_to_state(pred: pd.DataFrame) -> list[dict]:
 def pred_from_state(records: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(records, columns=PRED_COLUMNS)
     df["race_date"] = pd.to_datetime(df["race_date"])
-    for col in ("horse_weight", "weight_diff"):
+    for col in ("horse_weight", "weight_diff", "p_top3_model"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
@@ -191,12 +204,49 @@ def complete_race_info(race_info: dict, table: pd.DataFrame) -> dict:
     return race_info
 
 
-def predict_race(race_info: dict, booster, builder) -> tuple[dict, pd.DataFrame]:
-    """1 レースの出馬表・戦績・血統を取得して予測する. (補ったレース情報, 予測結果) を返す."""
-    table = build_race_table(race_info["race_id"])
+def apply_live_win_odds(table: pd.DataFrame, race_id: str) -> tuple[pd.DataFrame, dict]:
+    """今の単勝オッズを取得して, 出馬表の win_odds・popularity 列を置き換える. (置き換えた表, オッズの情報) を返す.
+
+    発売中・確定のオッズが取れなければ OddsNotAvailable を出す. オッズがない馬 (取消など) は欠損になる.
+    """
+    odds = fetch_win_odds(race_id)
+    if odds.odds.empty or odds.status not in LIVE_ODDS_STATUSES:
+        raise OddsNotAvailable(f"{race_id}: 推論に使える単勝オッズがありません (状態: {odds.status or '不明'}, {len(odds.odds)} 頭分)")
+    table = table.drop(columns=["win_odds", "popularity"], errors="ignore").merge(odds.odds, on="umaban", how="left")
+    missing = table.loc[table["win_odds"].isna(), "umaban"].tolist()
+    if missing:
+        print(f"{race_id}: 単勝オッズがない馬番 {missing} (取消などの可能性)")
+    status = ODDS_STATUS_JA.get(odds.status, odds.status or "状態不明")
+    return table, {"win_odds_note": f"{odds.official_datetime or '時刻不明'} 時点 ({status})"}
+
+
+def predict_race(
+    race_info: dict, booster, builder, table: pd.DataFrame | None = None, top3_model: tuple | None = None
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """1 レースを予測する. (補ったレース情報, 予測結果, 出馬表) を返す.
+
+    table (取得済みの出馬表・戦績・血統) がなければ取得する.
+    オッズとの差を学習したモデル (builder.market_offset) では, 毎回その時点の単勝オッズを取得して使う.
+    top3_model ((booster, builder). 3 着以内のモデル) があれば, 予測結果に p_top3_model (3 着以内の確率) を付ける.
+    """
+    if table is None:
+        table = build_race_table(race_info["race_id"])
     race_info = complete_race_info(race_info, table)
-    pred = predict_top3(table, booster, builder).reset_index(drop=True)
-    return race_info, pred
+    features = table
+    if getattr(builder, "market_offset", False):
+        features, odds_info = apply_live_win_odds(table, race_info["race_id"])
+        print(f"{race_info['race_id']}: 単勝オッズ {odds_info['win_odds_note']} を出発点にして予測します")
+        race_info = {**race_info, **odds_info}
+    top3_builder = top3_model[1] if top3_model is not None else None
+    if top3_builder is not None and getattr(top3_builder, "market_offset", False) and features is table:
+        features, odds_info = apply_live_win_odds(table, race_info["race_id"])
+        race_info = {**race_info, **odds_info}
+    pred = predict_win(features, booster, builder).reset_index(drop=True)
+    if top3_model is not None:
+        pred["p_top3_model"] = predict_top3(pred, *top3_model)["p_top3"].to_numpy()
+    else:
+        pred["p_top3_model"] = float("nan")
+    return race_info, pred, table
 
 
 def model_version_label(model_dir: str | Path) -> str:
@@ -212,6 +262,10 @@ def model_version_label(model_dir: str | Path) -> str:
     details = []
     if meta.get("train_period"):
         details.append(f"学習期間 {'〜'.join(meta['train_period'])}")
+    if meta.get("market_offset"):
+        details.append("単勝オッズとの差を学習したモデル")
+    if (model_dir / "model_top3.txt").exists():
+        details.append("3 着以内のモデル併用")
     test = meta.get("metrics", {}).get("test", {})
     if test.get("roc_auc") is not None:
         auc = f"テストのROC-AUC {test['roc_auc']:.3f}"
@@ -224,32 +278,39 @@ def model_version_label(model_dir: str | Path) -> str:
 def build_report(
     race_info: dict, pred: pd.DataFrame, betting: BettingConfig, label: str | None = None, model_version: str | None = None
 ) -> tuple[str, str]:
-    """予測結果と, 今のワイドのオッズから全ボックスの期待値を計算し, 通知の (件名, 本文) を返す.
+    """予測結果と, 今の各券種のオッズから買い方の期待値・的中率を計算し, 通知の (件名, 本文) を返す.
 
     オッズが取れなくても, 予測だけで通知文を作る.
     """
-    in_top = simulate_top3(pred)  # 乱数の種が固定なので, 同じ予測からは同じ結果になる
+    pred = pred.reset_index(drop=True)
+    # 1 着の確率 (p_win) で 1 着を選んで着順をシミュレーションし, 3 着以内・ワイド・3 連複・3 連単の確率を出す.
+    # 3 着以内のモデルの確率 (p_top3_model) があれば, 3 着以内の割合がそれに合うように 2・3 着を選ぶ
+    p_top3 = pred["p_top3_model"] if "p_top3_model" in pred else None
+    p_top3 = p_top3.to_numpy(dtype=float) if p_top3 is not None and p_top3.notna().all() else None
+    orders = simulate_orders(pred, p_top3=p_top3)  # 乱数の種が固定なので, 同じ予測からは同じ結果になる
+    in_top = orders_to_in_top(orders, len(pred))
+    pred = pred.assign(p_top3=in_top.mean(axis=0))
     wide = wide_probabilities(pred, in_top=in_top)
-    boxes = n_boxes_total = None
+    recommendations, portfolios = None, []
     try:
-        odds = fetch_wide_odds(race_info["race_id"])
-        status = {"middle": "発売中", "result": "確定"}.get(odds.status, odds.status or "状態不明")
-        odds_note = f"{odds.official_datetime or '時刻不明'} 時点 ({status})"
-        if odds.odds.empty:
-            odds_note = f"ワイドのオッズがまだありません ({status})"
+        odds = fetch_bet_odds(race_info["race_id"], betting.enabled_bet_types())
+        sample = next((o for o in odds.values() if not o.odds.empty), next(iter(odds.values()), None))
+        status = {"middle": "発売中", "result": "確定"}.get(sample.status, sample.status or "状態不明") if sample else "状態不明"
+        odds_note = f"{(sample.official_datetime if sample else None) or '時刻不明'} 時点 ({status})"
+        if all(o.odds.empty for o in odds.values()):
+            odds_note = f"オッズがまだありません ({status})"
         else:
-            wide_ev = wide_expected_values(wide, odds.odds, betting)
-            positive_boxes, n_boxes_total = all_box_expected_values(pred, wide_ev)
-            # 期待値がプラスのボックスを, 的中率の高い順に並べる (同じ的中率なら期待回収率の高い順)
-            boxes = add_box_hit_rates(positive_boxes, pred, in_top).sort_values(
-                ["hit_rate", "return_rate"], ascending=[False, False], ignore_index=True
-            )
+            recommendations = recommend_bets(pred, orders, odds, betting)
+            if betting.portfolio_enabled:
+                portfolios = [(obj, build_portfolio(pred, orders, odds, recommendations, betting, obj))
+                              for obj in betting.portfolio_objectives]
     except Exception as e:  # noqa: BLE001 - オッズが取れなくても予測は通知する
         odds_note = f"取得エラー: {type(e).__name__}"
-        print(f"{race_info['race_id']}: ワイドのオッズを取得できませんでした: {e}")
+        print(f"{race_info['race_id']}: オッズを取得できませんでした: {e}")
     return format_race_report(
-        race_info, pred, wide, boxes=boxes, n_boxes_total=n_boxes_total,
-        max_display=betting.box_max_display, odds_note=odds_note, label=label, model_version=model_version,
+        race_info, pred, wide, recommendations=recommendations, min_hit_rate=betting.min_hit_rate,
+        max_display=betting.max_display, odds_note=odds_note, label=label, model_version=model_version,
+        portfolios=portfolios, portfolio_settings=(betting.portfolio_max_stake, betting.portfolio_max_bets) if betting.portfolio_enabled else None,
     )
 
 
@@ -279,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         help="この分数を過ぎてから始まる通知は次の実行に任せて終了する (GITHUB_OUTPUT に continue=true を書く). 0 なら無制限",
     )
     parser.add_argument("--retry", type=int, default=3, help="推論・通知に失敗したときに何回まで試すか")
-    parser.add_argument("--race-id", help="時刻に関係なく, このレースを今のオッズで予測する (動作確認用)")
+    parser.add_argument("--race-id", help="時刻に関係なく, このレースを予測して今のオッズで期待値を計算する (動作確認用)")
     parser.add_argument("--now", help="現在時刻を上書きする (動作確認用. 例: '2026-11-22 14:30'. 待機せず, 残りを全部すぐ処理する)")
     parser.add_argument("--no-wait", action="store_true", help="通知のタイミングまで待たずにすぐ処理する (動作確認用)")
     parser.add_argument("--dry-run", action="store_true", help="通知せずに本文を表示する")
@@ -326,17 +387,23 @@ def main(argv: list[str] | None = None) -> int:
     def get_model():
         if not model:
             booster, builder, metadata = load_artifacts(args.model_dir)
+            top3 = load_top3_artifacts(args.model_dir)
             print(f"モデル: {model_version_label(args.model_dir)}")
-            model.update(booster=booster, builder=builder)
+            model.update(booster=booster, builder=builder, top3=None if top3 is None else (top3[0], top3[1]))
         return model["booster"], model["builder"]
 
+    tables: dict[str, pd.DataFrame] = {}  # 取得済みの出馬表・戦績・血統 (同じ実行の中で使い回す)
+
     def ensure_prediction(race_info: dict, fresh: bool = False) -> tuple[dict, pd.DataFrame]:
-        """予測済みならそれを使い (fresh=True なら予測し直す), なければ予測して状態ファイルに保存する."""
-        saved = state["predictions"].get(race_info["race_id"])
-        if saved and not fresh:
-            return {**race_info, **saved["race_info"]}, pred_from_state(saved["pred"])
-        print(f"{race_info['race_id']}: 予測しています...")
-        info, pred = predict_race(race_info, *get_model())
+        """予測し, 状態ファイルに保存する.
+
+        出馬表・戦績・血統は, 同じ実行の中で取得済みなら使い回す (fresh=True なら取り直す. 馬体重・出走取消などを反映するため).
+        """
+        race_id = race_info["race_id"]
+        table = None if fresh else tables.get(race_id)
+        print(f"{race_id}: 予測しています" + ("..." if table is None else " (取得済みの出馬表を使います)..."))
+        info, pred, table = predict_race(race_info, *get_model(), table=table, top3_model=model.get("top3"))
+        tables[race_id] = table
         state["predictions"][race_info["race_id"]] = {
             "race_info": {k: (str(v) if k == "start_time" else v) for k, v in info.items()},
             "pred": pred_to_state(pred),
@@ -344,14 +411,14 @@ def main(argv: list[str] | None = None) -> int:
         save_state(state_path, state)
         return info, pred
 
-    # 手動実行: 指定レースを今のオッズで予測して 1 通送る
+    # 手動実行: 指定レースを予測し, 今のオッズで期待値を計算して 1 通送る
     if args.race_id:
         races = schedule[schedule["race_id"] == args.race_id]
         race_info = races.iloc[0].to_dict() if not races.empty else {
             "race_id": args.race_id, "venue": "", "race_number": int(args.race_id[10:12]),
             "race_name": "", "course": "", "start_time": now,
         }
-        info, pred = ensure_prediction(race_info)
+        info, pred = ensure_prediction(race_info, fresh=True)
         send(*build_report(info, pred, betting, label="手動実行", model_version=model_version_label(args.model_dir)), args.dry_run)
         return 0
 
@@ -391,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
         key = (race_id, m)
         attempts[key] = attempts.get(key, 0) + 1
         try:
-            # 最初のタイミング (発走 12 分前) では必ずその時点で推論し直す (馬体重・出走取消などを反映)
+            # 推論する. 最初のタイミング (発走 12 分前) では出馬表を取り直す (馬体重・出走取消などを反映)
             info, pred = ensure_prediction(race, fresh=(m == odds_minutes[0]))
             send(*build_report(info, pred, betting, label=f"発走{m}分前", model_version=model_version_label(args.model_dir)), args.dry_run)
             sent_local.setdefault(race_id, []).append(m)

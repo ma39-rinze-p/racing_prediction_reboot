@@ -28,6 +28,47 @@ BASE_LABELS = {
     "race_surface": "芝・ダート",
     "race_track_condition": "当日の馬場状態",
     "n_horses": "出走頭数",
+    "race_distance": "距離",
+    "race_class": "クラス",
+    "race_prize": "1着の本賞金",
+    "race_n_front_runners": "レース内の逃げ・先行馬の頭数",
+    # 近走・能力 (build_features.HISTORY_FEATURE_NAMES)
+    "hist_n_starts": "通算の出走数",
+    "hist_n_starts_365": "直近1年の出走数",
+    "hist_days_since_last": "前走からの日数",
+    "hist_win_rate": "通算の勝率",
+    "hist_top3_rate": "通算の3着以内率",
+    "hist_prize_total": "通算の獲得賞金",
+    "hist_prize_365": "直近1年の獲得賞金",
+    "hist_last1_rank": "前走の着順",
+    "hist_last1_rank_ratio": "前走の着順/頭数",
+    "hist_avg3_rank_ratio": "直近3走の着順/頭数の平均",
+    "hist_avg5_rank_ratio": "直近5走の着順/頭数の平均",
+    "hist_best5_rank_ratio": "直近5走の着順/頭数の最小",
+    "hist_last1_margin": "前走の着差",
+    "hist_avg3_margin": "直近3走の着差の平均",
+    "hist_best5_margin": "直近5走の着差の最小",
+    "hist_last1_popularity": "前走の人気",
+    "hist_avg3_popularity": "直近3走の人気の平均",
+    "hist_avg5_rank_minus_pop": "直近5走の(着順-人気)の平均",
+    "hist_last1_log_odds": "前走の単勝オッズ(対数)",
+    "hist_avg3_log_odds": "直近3走の単勝オッズ(対数)の平均",
+    "hist_last1_agari": "前走の上がり3F",
+    "hist_best3_agari": "直近3走の上がり3Fの最速",
+    "hist_avg3_first_corner": "直近3走の最初のコーナーの位置(脚質)",
+    "hist_avg3_last_corner": "直近3走の最後のコーナーの位置",
+    "hist_avg3_gain": "直近3走の直線での追い上げ",
+    "hist_last1_class": "前走のクラス",
+    "hist_max5_class": "直近5走の最高クラス",
+    "hist_class_diff": "前走からのクラスの変化(昇級)",
+    "hist_distance_diff": "前走からの距離の変化",
+    "hist_surface_change": "前走から芝・ダートが変わったか",
+    "hist_jockey_change": "前走から騎手が変わったか",
+    "hist_weight_carried_diff": "前走からの斤量の変化",
+    # スピード指数 (model_features)
+    "speed_last1": "前走のスピード指数",
+    "speed_best3": "直近3走のスピード指数の最高",
+    "speed_avg3": "直近3走のスピード指数の平均",
     # 馬
     "waku": "枠番",
     "sex": "性別",
@@ -74,6 +115,12 @@ def feature_label_ja(name: str) -> str:
     if m:
         base = feature_label_ja(m.group(1))
         return f"{base}のレース内順位" if m.group(2) == "rank" else f"{base}のレース内平均との差"
+
+    # 騎手・調教師・父・母父の成績 (model_features で追加): {列名}_win_rate / _top3_rate / _n_runs
+    m = re.fullmatch(r"(jockey_name|trainer_name|sire|dam_sire)_(win_rate|top3_rate|n_runs)", name)
+    if m:
+        what = {"win_rate": "勝率", "top3_rate": "3着以内率", "n_runs": "出走数"}[m.group(2)]
+        return f"{BASE_LABELS[m.group(1)]}の{what}"
 
     # 今回のレース条件に対応する値 (model_features で追加): cur_*, shr_*
     m = re.fullmatch(r"(cur|shr)_(avg_rank|n_starts)_(surface|distance|condition|venue)", name)

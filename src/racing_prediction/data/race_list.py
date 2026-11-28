@@ -6,9 +6,14 @@ race_id の形式: YYYY(年) + VV(競馬場コード) + KK(回) + DD(日目) + R
 使用例:
     >>> from racing_prediction.data.race_list import find_race_ids
     >>> find_race_ids("東京", "2026-11-01", "2026-11-22", race_numbers=range(7, 13))
+    >>> find_race_ids(["東京", "京都"], "2026-11-01", "2026-11-22")   # 複数の競馬場
 
 アクセスは scrape_shutuba.polite_get を経由するため,
 User-Agent の付与とアクセスごとの 1〜3 秒ランダム待機が必ず行われる.
+
+開催カレンダー (月ごと) とレース ID の一覧 (開催日ごと) は, 終わった月・終わった開催日の分だけ
+data/raw/race_calendar/, data/raw/race_list/ に保存し, 次からはアクセスせずに使う (racing_prediction.data.cache).
+今月・今日以降は, 開催の変更 (中止・代替開催など) があり得るため毎回取得する.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import re
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from racing_prediction.data.cache import cache_dir, read_json, today_jst, write_json
 from racing_prediction.data.scrape_shutuba import polite_get
 
 CALENDAR_URL = "https://race.netkeiba.com/top/calendar.html"
@@ -64,16 +70,44 @@ def parse_kaisai_calendar_html(html: str) -> dict[pd.Timestamp, list[str]]:
 
 
 def fetch_kaisai_calendar(year: int, month: int) -> dict[pd.Timestamp, list[str]]:
-    """開催カレンダーを取得し, その月の {開催日: [競馬場名, ...]} を返す."""
+    """開催カレンダーを取得し, その月の {開催日: [競馬場名, ...]} を返す.
+
+    終わった月 (先月以前) は保存済みならアクセスせずに使い, 取得したら保存する.
+    """
+    path = cache_dir("race_calendar") / f"{year:04d}{month:02d}.json"
+    month_end = pd.Timestamp(year, month, 1) + pd.offsets.MonthEnd(0)
+    finished = month_end < today_jst()
+    if finished:
+        saved = read_json(path)
+        if isinstance(saved, dict):
+            return {pd.Timestamp(d): list(v) for d, v in saved.items()}
+
     response = polite_get(CALENDAR_URL, params={"year": year, "month": month})
     schedule = parse_kaisai_calendar_html(response.text)
-    return {d: v for d, v in schedule.items() if d.year == year and d.month == month}
+    schedule = {d: v for d, v in schedule.items() if d.year == year and d.month == month}
+    if finished and schedule:
+        write_json(path, {d.strftime("%Y-%m-%d"): v for d, v in schedule.items()})
+    return schedule
 
 
 def fetch_race_ids_on(date: pd.Timestamp) -> list[str]:
-    """開催日のレース一覧ページから, その日に行われる全レースの race_id を返す."""
+    """開催日のレース一覧ページから, その日に行われる全レースの race_id を返す.
+
+    終わった開催日 (昨日以前) は保存済みならアクセスせずに使い, 取得したら保存する.
+    """
+    date = pd.Timestamp(date).normalize()
+    path = cache_dir("race_list") / f"{date:%Y%m%d}.json"
+    finished = date < today_jst()
+    if finished:
+        saved = read_json(path)
+        if isinstance(saved, list) and saved:
+            return [str(r) for r in saved]
+
     response = polite_get(RACE_LIST_URL, params={"kaisai_date": date.strftime("%Y%m%d")})
-    return sorted(set(re.findall(r"race_id=(\d{12})", response.text)))
+    race_ids = sorted(set(re.findall(r"race_id=(\d{12})", response.text)))
+    if finished and race_ids:
+        write_json(path, race_ids)
+    return race_ids
 
 
 def parse_race_schedule_html(html: str, date: pd.Timestamp) -> pd.DataFrame:
@@ -119,20 +153,49 @@ def fetch_race_schedule(date: str | pd.Timestamp) -> pd.DataFrame:
     return parse_race_schedule_html(response.text, date)
 
 
+def venue_name_of(venue: str) -> str:
+    """競馬場名 ("東京") またはコード ("05") から競馬場名を返す."""
+    code = venue_code(venue)
+    return next(name for name, c in VENUE_CODES.items() if c == code)
+
+
+def venue_name_from_race_id(race_id: str) -> str:
+    """race_id の 5〜6 文字目 (競馬場コード) から競馬場名を返す. 例: "202605050507" -> "東京"."""
+    return venue_name_of(race_id[4:6])
+
+
+def _as_venue_list(venues: str | list[str] | tuple[str, ...]) -> list[str]:
+    """"東京" / "東京,京都" / ["東京", "京都"] / コード ("05") -> 競馬場名のリスト (重複なし, 指定順)."""
+    if isinstance(venues, str):
+        venues = [v for v in venues.split(",")]
+    names = []
+    for v in venues:
+        v = str(v).strip()
+        if v and venue_name_of(v) not in names:
+            names.append(venue_name_of(v))
+    if not names:
+        raise ValueError("競馬場を 1 つ以上指定してください")
+    return names
+
+
 def find_race_ids(
-    venue: str,
+    venues: str | list[str] | tuple[str, ...],
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
     race_numbers: range | list[int] = range(7, 13),
 ) -> list[tuple[pd.Timestamp, str]]:
-    """競馬場・期間 (両端を含む)・レース番号に該当するレースを (開催日, race_id) のリストで返す.
+    """競馬場 (複数可)・期間 (両端を含む)・レース番号に該当するレースを (開催日, race_id) のリストで返す.
 
-    アクセス回数は 期間の月数 (カレンダー) + 指定競馬場の開催日数 (レース一覧).
-    開催カレンダーで「指定した競馬場が開催している日」だけに絞ってからレース一覧を取得するため,
-    非開催日や他場だけが開催している日にはアクセスしない.
+    Args:
+        venues: 競馬場名 ("東京") / コード ("05") / そのリスト (["東京", "京都"]) / カンマ区切り ("東京,京都")
+
+    アクセス回数は 期間の月数 (カレンダー) + 指定競馬場のどれかが開催している日数 (レース一覧).
+    開催カレンダーで「指定した競馬場のどれかが開催している日」だけに絞ってからレース一覧を取得するため,
+    非開催日や他場だけが開催している日にはアクセスしない. レース一覧は 1 日 1 ページに全場が載っているので,
+    同じ日に開催する競馬場を複数指定してもアクセスは増えない.
     """
-    code = venue_code(venue)
-    venue_name = next(name for name, c in VENUE_CODES.items() if c == code)
+    names = _as_venue_list(venues)
+    codes = {VENUE_CODES[n] for n in names}
     start, end = pd.Timestamp(start_date), pd.Timestamp(end_date)
     if start > end:
         raise ValueError(f"開始日 {start.date()} が終了日 {end.date()} より後になっています")
@@ -141,12 +204,15 @@ def find_race_ids(
     schedule = {}
     for month_start in pd.date_range(start.replace(day=1), end, freq="MS"):
         schedule.update(fetch_kaisai_calendar(month_start.year, month_start.month))
-    kaisai_dates = sorted(d for d, venues in schedule.items() if start <= d <= end and venue_name in venues)
-    print(f"{venue_name} の開催日 ({len(kaisai_dates)} 日): {[d.strftime('%m/%d') for d in kaisai_dates]}")
+    in_period = {d: v for d, v in schedule.items() if start <= d <= end}
+    for name in names:
+        dates = sorted(d for d, held in in_period.items() if name in held)
+        print(f"{name} の開催日 ({len(dates)} 日): {[d.strftime('%m/%d') for d in dates]}")
+    kaisai_dates = sorted(d for d, held in in_period.items() if any(n in held for n in names))
 
     races = []
     for date in kaisai_dates:
         for race_id in fetch_race_ids_on(date):
-            if race_id[4:6] == code and int(race_id[10:12]) in numbers:
+            if race_id[4:6] in codes and int(race_id[10:12]) in numbers:
                 races.append((date, race_id))
-    return races
+    return sorted(races)
