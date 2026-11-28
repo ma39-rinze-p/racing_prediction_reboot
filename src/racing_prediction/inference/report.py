@@ -68,6 +68,15 @@ def bet_label(bet_type: str, method: str, groups) -> str:
     return "フォーメーション " + " / ".join(f"{i}列目{_horses(x)}" for i, x in enumerate(g, start=1))
 
 
+def _rate(p: float) -> str:
+    """的中率の表示 (1% 未満は小数 1 桁まで出す. 0% と表示すると当たらないように見えるため)."""
+    return f"{p:.1%}" if p < 0.01 else f"{p:.0%}"
+
+
+def _bet_detail(b) -> str:
+    return f"{b.n_tickets}点/{b.stake:,}円 的中率{_rate(b.hit_rate)} 期待払戻{b.expected_return:,.0f}円 回収率{b.return_rate:.0%}"
+
+
 def _bet_lines(
     recommendations: dict | None, max_display: int, min_hit_rate: float, odds_note: str | None
 ) -> tuple[list[str], int | None]:
@@ -75,7 +84,8 @@ def _bet_lines(
 
     recommendations: betting.strategies.recommend_bets の結果 ({券種: {"bets": DataFrame, ...}})
     """
-    lines = [f"■ おすすめの買い方 (期待値プラス かつ 的中率{min_hit_rate:.0%}以上. 券種ごとに的中率の高い順)"]
+    condition = "期待値プラス" + (f" かつ 的中率{min_hit_rate:.0%}以上" if min_hit_rate > 0 else "")
+    lines = [f"■ おすすめの買い方 ({condition}. 券種ごとに的中率の高い順)"]
     if recommendations is None:
         return lines + [f"  オッズを取得できなかったため計算していません ({odds_note or '不明'})"], None
     total = 0
@@ -97,11 +107,29 @@ def _bet_lines(
         more = f" (上位{len(shown)}通りを表示)" if len(bets) > len(shown) else ""
         lines.append(f"【{name_ja}】{len(bets):,}通り{more}")
         for i, b in enumerate(shown.itertuples(), start=1):
-            lines += [
-                f"{i:>2}. {bet_label(bet_type, b.method, b.groups)}",
-                f"    {b.n_tickets}点/{b.stake:,}円 的中率{b.hit_rate:.0%} 期待払戻{b.expected_return:,.0f}円 回収率{b.return_rate:.0%}",
-            ]
+            lines += [f"{i:>2}. {bet_label(bet_type, b.method, b.groups)}", f"    {_bet_detail(b)}"]
     return lines, total
+
+
+def _max_return_lines(recommendations: dict | None) -> list[str]:
+    """券種ごとの, 期待回収率が最大の買い方の欄 (おすすめの中で回収率が最も高いもの. 同じなら的中率が高い方)."""
+    if recommendations is None:
+        return []
+    lines = ["■ 回収率が最大の買い方 (券種ごと. 的中率は低いことが多いので注意)"]
+    best_all = None
+    for bet_type, name_ja in BET_TYPE_ORDER:
+        r = recommendations.get(bet_type)
+        if r is None or r.get("error") or r["bets"].empty:
+            continue
+        b = r["bets"].sort_values(["return_rate", "hit_rate"], ascending=False).iloc[0]
+        lines += [f"【{name_ja}】{bet_label(bet_type, b.method, b.groups)}", f"    {_bet_detail(b)}"]
+        if best_all is None or b.return_rate > best_all[1].return_rate:
+            best_all = (name_ja, b)
+    if best_all is None:
+        return lines + ["  期待値プラスの買い方がありません", ""]
+    lines.append(f"→ 全券種で回収率が最大: 【{best_all[0]}】{bet_label(best_all[1].bet_type, best_all[1].method, best_all[1].groups)}"
+                 f" (回収率{best_all[1].return_rate:.0%})")
+    return lines + [""]
 
 
 OBJECTIVE_JA = {
@@ -143,7 +171,7 @@ def _one_portfolio(portfolio: dict | None, naive_line: str | None) -> tuple[list
     for i, b in enumerate(portfolio["bets"].itertuples(), start=1):
         lines += [
             f"{i:>2}. 【{b.bet_type_ja}】{bet_label(b.bet_type, b.method, b.groups)}" + (" (押さえ)" if b.return_rate <= 1 else ""),
-            f"    {b.n_tickets}点/{b.stake:,}円 的中率{b.hit_rate:.0%} 回収率{b.return_rate:.0%}",
+            f"    {b.n_tickets}点/{b.stake:,}円 的中率{_rate(b.hit_rate)} 回収率{b.return_rate:.0%}",
         ]
 
     def summary(m: dict) -> str:
@@ -172,7 +200,7 @@ def format_race_report(
     wide: pd.DataFrame,
     n_wide: int = 5,
     recommendations: dict | None = None,
-    min_hit_rate: float = 0.2,
+    min_hit_rate: float = 0.0,
     max_display: int = 5,
     odds_note: str | None = None,
     label: str | None = None,
@@ -226,6 +254,7 @@ def format_race_report(
 
     bet_lines, n_positive = _bet_lines(recommendations, max_display, min_hit_rate, odds_note)
     lines += bet_lines + [""]
+    lines += _max_return_lines(recommendations)
     if recommendations is not None:
         lines += _portfolio_lines(portfolios or [], portfolio_settings)
     if recommendations is not None and odds_note:
@@ -247,7 +276,7 @@ def format_race_report(
         "",
         "※ 期待払戻 = 含まれる各点の (確率 × オッズ × 100円) の合計 (複勝・ワイドは最低オッズ). 確率はモデルの確率と",
         "  オッズから逆算した市場の確率を組み合わせたもの (オッズが高すぎる・モデルの確率が低すぎる点は市場の確率のみ.",
-        "  configs/betting.yaml). 的中率は含まれる点のどれかが当たる確率 (モデル).",
+        "  configs/betting.yaml). 的中率は含まれる点のどれかが当たる確率 (モデル). 回収率 = 期待払戻 / 購入額.",
         "※ リスクを分散した組み合わせ: 着順のシミュレーションの各結果で, 選んだ買い方の払戻を合計して数えた確率.",
         "  同じ馬に頼った買い方ばかりだと, その馬が来なかったときに全部外れる (共倒れ) ため, 外れ方の違う買い方を選ぶ.",
         "  (押さえ) は単独では期待値がマイナスの買い方 (モデルが評価する馬が来なかったときの保険. 全体の期待値はプラスのまま).",

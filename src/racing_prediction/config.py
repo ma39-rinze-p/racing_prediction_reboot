@@ -75,7 +75,7 @@ DEFAULT_BET_TYPES = {
 class BettingConfig:
     """買い方の期待値の計算と, メールに載せる買い方の設定 (configs/betting.yaml)."""
 
-    min_hit_rate: float = 0.10  # メールに載せる買い方の的中率の下限 (期待値プラスのうち, これ以上のものだけ載せる)
+    min_hit_rate: float = 0.0  # メールに載せる買い方の的中率の下限 (期待値プラスのうち, これ以上のものだけ載せる. 0 なら下限なし)
     candidates: int = 7  # ボックス・ながし・フォーメーションに使う馬 (3 着以内の確率が高い順) の頭数
     max_tickets: int = 30  # 1 つの買い方の最大点数
     max_display: int = 5  # 券種ごとにメールに載せる買い方の最大数
