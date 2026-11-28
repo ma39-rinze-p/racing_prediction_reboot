@@ -52,7 +52,7 @@ PRODUCTION_DIR = ROOT / "models" / "production"
 MODEL_FILES = ["model.txt", "metadata.json", "feature_importance.csv"]
 REQUIRED_FILES = ["model.txt", "metadata.json"]
 # 評価結果 (ノートブックの results/ の出力) のうち, バージョンごとに残すもの
-RESULT_FILES = ["summary.json", "roc_curve.png", "calibration.csv"]
+RESULT_FILES = ["summary.json", "roc_curve.png", "calibration.csv", "calibration_bins.png"]
 METRICS_FILE = "METRICS.md"
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -97,6 +97,13 @@ def _summary(model_dir: Path) -> dict:
         "test_period": metrics.get("test_period"),
         "test_metrics": {k: test.get(k) for k in keys if k in test},
         "test_odds_baseline": {k: odds.get(k) for k in keys if k in odds},
+        # 予測 1 位の馬と 1 番人気の馬の 1 着的中率の比較 (predict_model.compare_top_pick. 古いモデルにはない)
+        "test_top_pick": metrics.get("test_top_pick", {}),
+        # モデルを混ぜるとオッズ単体より当たるか (predict_model.compare_with_market. メインの目標. 古いモデルにはない)
+        "test_market_blend": metrics.get("test_market_blend", {}),
+        "market_offset": bool(meta.get("market_offset", False)),
+        # スコアを頭数が同じになるように 10 等分した帯ごとの, スコアの平均と実際の 1 着率 (predict_model.compare_calibration. 古いモデルにはない)
+        "test_calibration": metrics.get("test_calibration", {}),
     }
 
 
@@ -160,6 +167,139 @@ def _fmt(value, digits: int = 4) -> str:
     return "-" if value is None else f"{value:.{digits}f}"
 
 
+def _pct(value, signed: bool = False) -> str:
+    return "-" if value is None else (f"{value:+.1%}" if signed else f"{value:.1%}")
+
+
+def _top_pick_lines(t: dict) -> list[str]:
+    """METRICS.md の「予測 1 位の馬 vs 1 番人気の馬」の節 (比較の結果がなければ空)."""
+    if not t.get("n_races"):
+        return []
+    low, high = t.get("diff_ci_low"), t.get("diff_ci_high")
+    verdict = ("予測 1 位の方がよく当たる" if low is not None and low > 0 else
+               "1 番人気の方がよく当たる" if high is not None and high < 0 else "差があるとは言えない")
+    return [
+        "## 予測 1 位の馬 vs 1 番人気の馬 (テスト期間)",
+        "",
+        "モデルのスコアがトップの馬と, 単勝オッズが一番低い馬 (1 番人気) が 1 着になった割合の比較.",
+        "",
+        "| 項目 | 値 |",
+        "|---|---:|",
+        f"| レース数 | {t['n_races']} |",
+        f"| 予測 1 位の馬が 1 着 | {_pct(t.get('model_hit'))} |",
+        f"| 1 番人気の馬が 1 着 | {_pct(t.get('favorite_hit'))} |",
+        f"| 差 (予測 1 位 - 1 番人気) | {_pct(t.get('diff'), True)} (95% 信頼区間 {_pct(low, True)} 〜 {_pct(high, True)}) |",
+        f"| p 値 (マクネマー検定) | {_fmt(t.get('p_value'), 3)} |",
+        f"| 判定 | {verdict} |",
+        f"| 予測 1 位と 1 番人気が同じ馬だった割合 | {_pct(t.get('same_rate'))} |",
+        f"| 違う馬だったレースでの 1 着率 (予測 1 位 / 1 番人気) | {_pct(t.get('model_hit_when_diff'))} / {_pct(t.get('favorite_hit_when_diff'))} |",
+        "",
+        *_return_lines(t),
+    ]
+
+
+def market_blend_verdict(t: dict) -> str:
+    """メインの目標の判定 (racing_prediction.models.predict_model.market_blend_verdict と同じ.
+    このスクリプトは LightGBM などがなくても動くよう, パッケージを読み込まない)."""
+    if not t.get("n_races"):
+        return "比べられるレースがありません"
+    if t.get("goal_met"):
+        return "目標達成: モデルを混ぜるとオッズ単体より当たる (モデルにオッズにない情報がある)"
+    if max(t.get("logloss_gain") or 0, t.get("model_gain") or 0) > 0:
+        return "目標未達: オッズよりわずかに良いが, 偶然の範囲を出ない"
+    return "目標未達: オッズ単体の方が当たる (モデルにオッズにない情報はまだない)"
+
+
+def _market_blend_lines(t: dict) -> list[str]:
+    """METRICS.md の「メインの目標」の節 (結果がなければ空)."""
+    if not t.get("n_races"):
+        return []
+    return [
+        "## メインの目標: モデルを混ぜると, オッズ単体より当たるか (テスト期間)",
+        "",
+        "各馬のスコア = a × log(モデルの確率) + b × log(オッズの確率) で混ぜ, オッズ単体 (そのままと補正後の良い方) と比べる.",
+        "テスト期間を前半・後半に分け, 混ぜ方を決めていない方のレースで評価. 混ぜた予測かモデル単体の logloss の改善の",
+        "95% 信頼区間が 0 より上なら目標達成 (オッズとの差を学習したモデルは, モデル単体がすでにオッズと混ざった予測).",
+        "",
+        f"**判定: {market_blend_verdict(t)}**",
+        "",
+        "| 項目 | オッズ単体 | 混ぜた予測 | モデル単体 |",
+        "|---|---:|---:|---:|",
+        f"| logloss (小さいほど当たる) | {_fmt(t.get('market_logloss'), 4)} | {_fmt(t.get('blend_logloss'), 4)} | {_fmt(t.get('model_logloss'), 4)} |",
+        f"| 1 着的中率 | {_pct(t.get('market_hit'))} | {_pct(t.get('blend_hit'))} | {_pct(t.get('model_hit'))} |",
+        "",
+        "| 項目 | 値 |",
+        "|---|---:|",
+        f"| レース数 | {t['n_races']} |",
+        f"| logloss の改善 (オッズ単体 - 混ぜた予測) | {_fmt(t.get('logloss_gain'), 4)} "
+        f"(95% 信頼区間 {_fmt(t.get('logloss_gain_ci_low'), 4)} 〜 {_fmt(t.get('logloss_gain_ci_high'), 4)}) |",
+        f"| logloss の改善 (オッズ単体 - モデル単体) | {_fmt(t.get('model_gain'), 4)} "
+        f"(95% 信頼区間 {_fmt(t.get('model_gain_ci_low'), 4)} 〜 {_fmt(t.get('model_gain_ci_high'), 4)}) |",
+        f"| 混ぜ方の重み (モデル / オッズ) | {_fmt(t.get('model_weight'), 3)} / {_fmt(t.get('market_weight'), 3)} |",
+        f"| モデルの重みが 0 より大きいかの p 値 | {_fmt(t.get('model_weight_p_value'), 3)} |",
+        f"| 期待値 > {t.get('value_threshold', 1.0)} の馬の単勝 (頭数 / 回収率) | {t.get('n_value_bets', '-')} / {_pct(t.get('value_bet_return'))} |",
+        "",
+    ]
+
+
+def _calibration_lines(c: dict) -> list[str]:
+    """METRICS.md の「スコアと実際の 1 着率のずれ」の節 (結果がなければ空)."""
+    model = c.get("model") or {}
+    if not model.get("bins"):
+        return []
+    odds = {b["bin"]: b for b in (c.get("odds") or {}).get("bins", [])}
+    quantile = c.get("method", "width") == "quantile"
+    rows = []
+    for b in model["bins"]:
+        o = odds.get(b["bin"], {})
+        ci = f"{_pct(b.get('ci_low'))}〜{_pct(b.get('ci_high'))}" if b.get("n") else "-"
+        rows.append(f"| {b['bin']} | {b.get('range', '-')} | {b.get('n') or 0:,} | {_pct(b.get('mean_score'))} | {_pct(b.get('win_rate'))} | "
+                    f"{_pct(b.get('diff'), True)} | {ci} | {o.get('range', '-')} | {_pct(o.get('mean_score'))} | "
+                    f"{_pct(o.get('win_rate'))} | {_pct(o.get('diff'), True)} |")
+    odds_summary = c.get("odds") or {}
+    how = ("スコアの低い順に並べ, 頭数が同じになるように 10 等分 (1 = 最も低い 10%. 単勝オッズはそれ自身の順で 10 等分)"
+           if quantile else "スコアの値で 10% ごとに区切った帯")
+    image = "calibration_bins.png" if (PRODUCTION_DIR / "calibration_bins.png").exists() else None
+    return [
+        "## スコアと実際の 1 着率のずれ (テスト期間)",
+        "",
+        f"{how}. 差 = 実際の 1 着率 - スコアの平均 (プラス = 過小評価, マイナス = 過大評価).",
+        "ECE = 帯ごとの |差| を頭数で重み付けした平均 (小さいほど良い).",
+        "",
+        f"ECE: モデル {_fmt(model.get('ece'), 4)} / 単勝オッズ {_fmt(odds_summary.get('ece'), 4)}"
+        f" (スコアの平均が 1 着率の 95% 信頼区間の外にある帯: モデル {model.get('n_outside_ci', '-')} 個 / 単勝オッズ {odds_summary.get('n_outside_ci', '-')} 個)",
+        "",
+        "| 帯 | スコアの範囲 | 頭数 | スコアの平均 | 実際の 1 着率 | 差 | 1 着率の 95% 信頼区間 | オッズの範囲 | オッズの平均 | 実際の 1 着率 (オッズ) | 差 (オッズ) |",
+        "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|",
+        *rows,
+        "",
+        f"![スコアと実際の 1 着率]({image})" if image else "",
+        "",
+    ]
+
+
+def _yen(value) -> str:
+    return "-" if value is None else f"{value:+,.0f} 円"
+
+
+def _return_lines(t: dict) -> list[str]:
+    """単勝 100 円ずつ買った場合の総利益と回収率 (結果がなければ空)."""
+    if t.get("model_return") is None:
+        return []
+    bet = t.get("bet_per_race", 100)
+    return [
+        f"各レースで単勝を {bet} 円ずつ買った場合 (賭け金の合計 {bet * t['n_races']:,} 円. 払戻は確定した単勝オッズ x {bet} 円):",
+        "",
+        "| 賭けた馬 | 総利益 | 回収率 |",
+        "|---|---:|---:|",
+        f"| 予測 1 位の馬 | {_yen(t.get('model_profit'))} | {_pct(t.get('model_return'))} |",
+        f"| 1 番人気の馬 | {_yen(t.get('favorite_profit'))} | {_pct(t.get('favorite_return'))} |",
+        f"| 差 (予測 1 位 - 1 番人気) | {_yen((t.get('model_profit') or 0) - (t.get('favorite_profit') or 0))} | "
+        f"{_pct(t.get('return_diff'), True)} (95% 信頼区間 {_pct(t.get('return_diff_ci_low'), True)} 〜 {_pct(t.get('return_diff_ci_high'), True)}) |",
+        "",
+    ]
+
+
 def _write_metrics_file(version: str, info: dict) -> None:
     """適用中のモデルの精度を models/production/METRICS.md にまとめる (GitHub の画面でも読める)."""
     m, o = info.get("test_metrics", {}), info.get("test_odds_baseline", {})
@@ -167,7 +307,7 @@ def _write_metrics_file(version: str, info: dict) -> None:
         ("ROC-AUC (1 着か否か)", "roc_auc", 4),
         ("ROC-AUC (レースごとの平均)", "roc_auc_by_race", 4),
         ("logloss (レース単位. 小さいほど良い)", "logloss", 4),
-        ("予測 1 位の馬が 1 着だった割合", "win_hit", 3),
+        ("予測 1 位の馬が 1 着だった割合 (単勝オッズの列は 1 番人気)", "win_hit", 3),
         ("予測上位 3 頭のうち 3 着以内だった割合", "top3_precision", 3),
         ("予測上位 2 頭のワイドが的中した割合", "wide_top_pair_hit", 3),
     ]
@@ -181,16 +321,20 @@ def _write_metrics_file(version: str, info: dict) -> None:
         f"| 学習した日時 | {info.get('trained_at') or '-'} |",
         f"| 学習期間 | {'〜'.join(info.get('train_period') or ['-', '-'])} ({info.get('n_train_races') or '-'} レース) |",
         f"| テスト期間 | {'〜'.join(info.get('test_period') or ['-', '-'])} |",
+        f"| モデルの種類 | {'単勝オッズとの差を学習 (推論に発走前の単勝オッズを使う)' if info.get('market_offset') else 'オッズを使わない'} |",
         f"| 適用した日時 | {_now()} |",
         "",
+        *_market_blend_lines(info.get("test_market_blend") or {}),
         "## テスト期間の精度",
         "",
-        "単勝オッズ = 確定単勝オッズから逆算した確率で予想した場合 (比較用. オッズはレース後に確定する値なので, モデルの特徴量には使っていない).",
+        "単勝オッズ = 確定単勝オッズから逆算した確率で予想した場合 (比較用).",
         "",
         "| 指標 | モデル | 単勝オッズ |",
         "|---|---:|---:|",
         *[f"| {label} | {_fmt(m.get(key), d)} | {_fmt(o.get(key), d)} |" for label, key, d in rows],
         "",
+        *_top_pick_lines(info.get("test_top_pick") or {}),
+        *_calibration_lines(info.get("test_calibration") or {}),
         "## ROC 曲線 (テスト期間)",
         "",
         "![ROC 曲線](roc_curve.png)" if (PRODUCTION_DIR / "roc_curve.png").exists() else "(ROC 曲線の画像がありません)",

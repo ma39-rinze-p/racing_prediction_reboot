@@ -33,7 +33,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from model_registry import JST, load_registry, register, version_name
+from model_registry import JST, load_registry, market_blend_verdict, register, version_name
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "reports" / "kaggle_runs"  # Kaggle の実行結果の保存先 (git 管理外)
@@ -129,6 +129,23 @@ def print_summary() -> None:
     test = info.get("test_metrics", {})
     if test:
         print(f"  テスト: ROC-AUC={test.get('roc_auc')} レース内AUC={test.get('roc_auc_by_race')} logloss={test.get('logloss')} 単勝的中率={test.get('win_hit')}")
+    mb = info.get("test_market_blend") or {}
+    if mb.get("n_races"):
+        print(f"  メインの目標 (混ぜるとオッズより当たるか): {market_blend_verdict(mb)}")
+        print(f"    logloss オッズ単体 {mb['market_logloss']:.4f} → 混ぜた予測 {mb['blend_logloss']:.4f} "
+              f"(改善 {mb['logloss_gain']:+.4f}, 95% 信頼区間 {mb['logloss_gain_ci_low']:+.4f} 〜 {mb['logloss_gain_ci_high']:+.4f})")
+    cal = (info.get("test_calibration") or {}).get("model") or {}
+    if cal.get("bins"):
+        odds_ece = ((info.get("test_calibration") or {}).get("odds") or {}).get("ece")
+        print(f"  スコアと実際の 1 着率のずれ (頭数が同じになるように 10 等分): ECE {cal['ece']:.4f}"
+              + (f" (単勝オッズ {odds_ece:.4f})" if odds_ece is not None else ""))
+    top = info.get("test_top_pick") or {}
+    if top.get("n_races"):
+        print(f"  1 着になった割合: 予測 1 位 {top['model_hit']:.1%} / 1 番人気 {top['favorite_hit']:.1%} "
+              f"(差 {top['diff']:+.1%}, 95% 信頼区間 {top['diff_ci_low']:+.1%} 〜 {top['diff_ci_high']:+.1%})")
+        if top.get("model_return") is not None:
+            print(f"  単勝 {top['bet_per_race']} 円ずつ: 予測 1 位 総利益 {top['model_profit']:+,.0f} 円 (回収率 {top['model_return']:.1%}) / "
+                  f"1 番人気 総利益 {top['favorite_profit']:+,.0f} 円 (回収率 {top['favorite_return']:.1%})")
     print("一覧: python scripts/model_registry.py list / 1 つ前に戻す: rollback / ROC-AUC 最良に戻す: best")
     print("GitHub Actions で使うには commit & push してください:")
     print("  git add models && git commit -m \"update production model\" && git push")

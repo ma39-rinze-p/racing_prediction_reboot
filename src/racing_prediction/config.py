@@ -30,6 +30,8 @@ class TrainConfig:
     n_trials: int
     timeout_sec: int | None
     n_folds: int
+    # True: オッズとの差だけを学習する (単勝オッズの確率を出発点にする. 推論に発走前の単勝オッズが必要)
+    market_offset: bool = True
 
     def to_dict(self) -> dict:
         """metadata.json などに保存できる形 (日付は文字列) にする."""
@@ -102,6 +104,7 @@ def load_train_config(path: str | Path) -> TrainConfig:
         raise FileNotFoundError(f"設定ファイルがありません: {path}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     data, split, tuning = raw.get("data") or {}, raw.get("split") or {}, raw.get("tuning") or {}
+    model = raw.get("model") or {}
 
     cfg = TrainConfig(
         start_date=_date(data.get("start_date"), "data.start_date"),
@@ -111,6 +114,7 @@ def load_train_config(path: str | Path) -> TrainConfig:
         n_trials=int(tuning.get("n_trials", 100)),
         timeout_sec=None if tuning.get("timeout_sec") is None else int(tuning["timeout_sec"]),
         n_folds=int(tuning.get("n_folds", 3)),
+        market_offset=bool(model.get("market_offset", True)),
     )
 
     errors = []

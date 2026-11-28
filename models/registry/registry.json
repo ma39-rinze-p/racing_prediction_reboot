@@ -1,5 +1,5 @@
 {
-  "active": "v20261124_213539",
+  "active": "v20261128_173306",
   "policy": "best",
   "versions": {
     "v20261124_204146": {
@@ -63,6 +63,99 @@
         "top3_precision": 0.5370370370370371,
         "wide_top_pair_hit": 0.3333333333333333
       }
+    },
+    "v20261128_141010": {
+      "registered_at": "2026-11-28 14:12:13",
+      "source": "Kaggle ma39rinzep/predict-jra-racing (reports/kaggle_runs/20261128/v20261128_141010)",
+      "target": "is_win",
+      "trained_at": "2026-11-28T14:10:10+09:00",
+      "train_period": [
+        "2024-01-06",
+        "2026-11-22"
+      ],
+      "n_train_races": 9997,
+      "test_period": [
+        "2026-05-02",
+        "2026-11-22"
+      ],
+      "test_metrics": {
+        "roc_auc_by_race": 0.7790402887935305,
+        "roc_auc": 0.7966042605884294,
+        "logloss": 2.08561615702326,
+        "win_hit": 0.27856420626895856,
+        "top3_precision": 0.4858442871587462,
+        "wide_top_pair_hit": 0.27098078867542974
+      },
+      "test_odds_baseline": {
+        "roc_auc_by_race": 0.819982645982988,
+        "roc_auc": 0.8381854264176165,
+        "logloss": 1.9019890575997183,
+        "win_hit": 0.3483316481294237,
+        "top3_precision": 0.5284799460734748,
+        "wide_top_pair_hit": 0.3316481294236603
+      }
+    },
+    "v20261128_163835": {
+      "registered_at": "2026-11-28 16:40:10",
+      "source": "Kaggle ma39rinzep/predict-jra-racing (reports/kaggle_runs/20261128/v20261128_163835)",
+      "target": "is_win",
+      "trained_at": "2026-11-28T16:38:35+09:00",
+      "train_period": [
+        "2025-11-23",
+        "2026-11-22"
+      ],
+      "n_train_races": 3459,
+      "test_period": [
+        "2026-09-20",
+        "2026-11-22"
+      ],
+      "test_metrics": {
+        "roc_auc_by_race": 0.7708910729737843,
+        "roc_auc": 0.7890314094989564,
+        "logloss": 2.1183694321296995,
+        "win_hit": 0.29780033840947545,
+        "top3_precision": 0.4827975183305132,
+        "wide_top_pair_hit": 0.2656514382402707
+      },
+      "test_odds_baseline": {
+        "roc_auc_by_race": 0.8153118174803753,
+        "roc_auc": 0.8349997228955973,
+        "logloss": 1.9189771603961354,
+        "win_hit": 0.34686971235194586,
+        "top3_precision": 0.5279187817258884,
+        "wide_top_pair_hit": 0.34348561759729274
+      }
+    },
+    "v20261128_173306": {
+      "registered_at": "2026-11-28 17:34:54",
+      "source": "Kaggle ma39rinzep/predict-jra-racing (reports/kaggle_runs/20261128/v20261128_173306)",
+      "target": "is_win",
+      "trained_at": "2026-11-28T17:33:06+09:00",
+      "train_period": [
+        "2024-01-06",
+        "2026-11-22"
+      ],
+      "n_train_races": 9997,
+      "test_period": [
+        "2026-05-02",
+        "2026-11-22"
+      ],
+      "test_metrics": {
+        "roc_auc_by_race": 0.780681400478953,
+        "roc_auc": 0.7986637636769562,
+        "logloss": 2.078723671906244,
+        "win_hit": 0.2826086956521739,
+        "top3_precision": 0.48533872598584427,
+        "wide_top_pair_hit": 0.2684529828109201
+      },
+      "test_odds_baseline": {
+        "roc_auc_by_race": 0.819982645982988,
+        "roc_auc": 0.8381854264176165,
+        "logloss": 1.9019890575997183,
+        "win_hit": 0.3483316481294237,
+        "top3_precision": 0.5284799460734748,
+        "wide_top_pair_hit": 0.3316481294236603
+      }
     }
   },
   "history": [
@@ -77,10 +170,24 @@
       "activated_at": "2026-11-24 21:37:00",
       "reason": "v20261124_213539 を登録 (ROC-AUC が最良のモデルを自動で適用)",
       "previous": "v20261124_204146"
+    },
+    {
+      "version": "v20261128_141010",
+      "activated_at": "2026-11-28 14:12:13",
+      "reason": "v20261128_141010 を登録 (ROC-AUC が最良のモデルを自動で適用)",
+      "previous": "v20261124_213539"
+    },
+    {
+      "version": "v20261128_173306",
+      "activated_at": "2026-11-28 17:34:54",
+      "reason": "v20261128_173306 を登録 (ROC-AUC が最良のモデルを自動で適用)",
+      "previous": "v20261128_141010"
     }
   ],
   "stack": [
     "v20261124_204146",
-    "v20261124_213539"
+    "v20261124_213539",
+    "v20261128_141010",
+    "v20261128_173306"
   ]
 }

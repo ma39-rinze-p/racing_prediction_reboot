@@ -16,10 +16,11 @@ FeatureBuilder.fit で学習し,
                  その騎手などの 勝率・3 着以内率・出走数 (対象レースより前の学習データのレースだけで計算).
                  名前をそのままカテゴリ変数にすると, 種類が多すぎてモデルが丸暗記する (過学習) ため置き換えた
     race_n_front_runners: レース内の逃げ・先行馬の頭数 (展開)
-    odds_*     : 単勝オッズ (win_odds 列). 学習では確定オッズ, 推論では推論時点 (発走 12 分前) に取得したオッズ
-                 (inference/run.py が win_odds 列を置き換える)
     *_race_rank: レース内での順位 (0〜1, 小さいほど値が小さい). 他の馬との比較を表す
     *_race_diff: レース内平均との差
+
+オッズに関する情報 (今回の単勝オッズ・人気, 過去のレースの人気・単勝オッズ) は特徴量に使わない (ODDS_COLUMNS).
+モデルは市場の評価に頼らずに予測し, オッズはワイドの期待値の計算と精度の比較 (参考) にだけ使う.
 """
 
 from __future__ import annotations
@@ -53,6 +54,15 @@ CATEGORICAL_COLUMNS = [
 RATE_COLUMNS = ["jockey_name", "trainer_name", "sire", "dam_sire"]
 # 成績を出すにはデータが少なすぎる (1 頭ごとにほぼ違う) ため, 特徴量に使わない列
 DROPPED_COLUMNS = ["dam", "sire_sire", "sire_dam", "dam_dam"]
+# オッズに関する列 (過去のレースの人気・単勝オッズ). CSV には残すが, 特徴量には使わない.
+# 今回のレースの単勝オッズ・人気 (win_odds, popularity) はもともと特徴量の列 (feature_columns) に入っていない
+ODDS_COLUMNS = [
+    "hist_last1_popularity",
+    "hist_avg3_popularity",
+    "hist_avg5_rank_minus_pop",
+    "hist_last1_log_odds",
+    "hist_avg3_log_odds",
+]
 # 勝率などを全体の平均に寄せる強さ (この出走数分だけ「全体平均の成績」を足したとみなす)
 RATE_SMOOTHING = 20.0
 
@@ -68,7 +78,6 @@ RELATIVE_COLUMNS = [
     "age",
     "hist_avg3_rank_ratio",
     "hist_avg3_margin",
-    "hist_avg3_log_odds",
     "hist_prize_365",
     "hist_best3_agari",
     "hist_avg3_first_corner",
@@ -91,12 +100,15 @@ _VENUE_KEYS = {name: key for key, name in VENUES.items()}
 _CONDITION_KINDS = ["surface", "distance", "condition", "venue"]
 
 
-def load_race_csvs(races_dir: str | Path) -> pd.DataFrame:
+def load_race_csvs(races_dir: str | Path | list[str | Path]) -> pd.DataFrame:
     """races_dir 以下の全 CSV ({競馬場}/{開催日}/{R}R.csv) を読み込んで縦に結合する.
+
+    races_dir はフォルダのリストでもよい (Kaggle では半年ごとのデータセットに分かれているため).
 
     必要な列が欠けている CSV (列追加前に保存した古いもの) は警告を出して読み飛ばす.
     """
-    paths = sorted(Path(races_dir).rglob("*.csv"))
+    dirs = races_dir if isinstance(races_dir, (list, tuple)) else [races_dir]
+    paths = sorted(path for d in dirs for path in Path(d).rglob("*.csv"))
     if not paths:
         raise FileNotFoundError(f"{races_dir} に CSV がありません")
 
@@ -160,6 +172,9 @@ class FeatureBuilder:
         self.speed_base: dict[str, float] = {}
         self.speed_base_coarse: dict[str, float] = {}
         self.speed_condition: dict[str, float] = {}
+        # True なら「オッズとの差だけを学習したモデル」用: 予測時にモデルの出力へ単勝オッズの確率の対数を足す
+        # (predict_model.predict_win. オッズは特徴量には入れない)
+        self.market_offset: bool = False
 
     # ---- 学習 -------------------------------------------------------------
     def fit(self, df: pd.DataFrame) -> "FeatureBuilder":
@@ -279,7 +294,7 @@ class FeatureBuilder:
         return out
 
     def _build(self, df: pd.DataFrame) -> pd.DataFrame:
-        excluded = set(CATEGORICAL_COLUMNS) | set(RATE_COLUMNS) | set(DROPPED_COLUMNS)
+        excluded = set(CATEGORICAL_COLUMNS) | set(RATE_COLUMNS) | set(DROPPED_COLUMNS) | set(ODDS_COLUMNS)
         base_cols = [c for c in feature_columns() if c not in excluded]
         X = df[base_cols].apply(pd.to_numeric, errors="coerce").astype(float)
 
@@ -294,9 +309,8 @@ class FeatureBuilder:
                 np.nan_to_num(avg, nan=0.0) * n0 + self.rank_prior * SHRINK_STRENGTH
             ) / (n0 + SHRINK_STRENGTH)
 
-        # スピード指数, 騎手などの成績, 単勝オッズ
-        X = pd.concat([X, self._speed_figures(df), self._rates(df), _odds_features(df)], axis=1)
-        X["odds_log_minus_hist"] = X["odds_log"] - X["hist_avg3_log_odds"]  # 近走より人気になっているか (マイナスなら人気上昇)
+        # スピード指数, 騎手などの成績
+        X = pd.concat([X, self._speed_figures(df), self._rates(df)], axis=1)
 
         # 展開: レース内の逃げ・先行馬 (直近 3 走の最初のコーナーの位置が前の方) の頭数
         front = (X["hist_avg3_first_corner"] < FRONT_RUNNER_RATIO).astype(float)
@@ -340,6 +354,7 @@ class FeatureBuilder:
             "speed_base": self.speed_base,
             "speed_base_coarse": self.speed_base_coarse,
             "speed_condition": self.speed_condition,
+            "market_offset": self.market_offset,
         }
 
     @classmethod
@@ -349,6 +364,7 @@ class FeatureBuilder:
         builder.rank_prior = d["rank_prior"]
         builder.feature_names = d["feature_names"]
         builder.rate_priors = d.get("rate_priors", {})
+        builder.market_offset = bool(d.get("market_offset", False))
         # 合計は「学習期間の最終日」の 1 回分の成績として持つ (それより後のレースにだけ使われる)
         as_of = pd.Timestamp(d["rate_as_of"]) if d.get("rate_as_of") else None
         builder.rate_events = {
@@ -363,28 +379,6 @@ class FeatureBuilder:
         builder.speed_base_coarse = d.get("speed_base_coarse", {})
         builder.speed_condition = d.get("speed_condition", {})
         return builder
-
-
-def _odds_features(df: pd.DataFrame) -> pd.DataFrame:
-    """単勝オッズの特徴量.
-
-    odds_log : 単勝オッズの対数
-    odds_prob: 1 / オッズ をレース内の合計が 1 になるよう揃えた値 (市場が見積もる 1 着の確率. 控除率の分は取り除かれる)
-    odds_rank: レース内のオッズの順位 (1 = 1 番人気). 人気 (popularity) 列は使わず, オッズから計算する
-               (推論時に取得するオッズと確実に揃えるため)
-    オッズがない馬 (取消など) は欠損.
-    """
-    odds = pd.to_numeric(df["win_odds"], errors="coerce").where(lambda o: o > 0)
-    race = df["race_id"].to_numpy()
-    inv = 1.0 / odds
-    return pd.DataFrame(
-        {
-            "odds_log": np.log(odds),
-            "odds_prob": inv / inv.groupby(race).transform("sum"),
-            "odds_rank": odds.groupby(race).rank(method="min"),
-        },
-        index=df.index,
-    )
 
 
 def _past_runs(df: pd.DataFrame, keep_missing: bool = False) -> pd.DataFrame:

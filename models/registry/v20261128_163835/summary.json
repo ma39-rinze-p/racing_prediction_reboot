@@ -1,0 +1,72 @@
+{
+  "config": {
+    "start_date": "2025-11-23",
+    "end_date": "2026-11-22",
+    "venues": null,
+    "test_ratio": 0.2,
+    "n_trials": 150,
+    "timeout_sec": 14400,
+    "n_folds": 3
+  },
+  "data_period": [
+    "2025-11-23",
+    "2026-11-22"
+  ],
+  "train_period": [
+    "2025-11-23",
+    "2026-09-19"
+  ],
+  "test_period": [
+    "2026-09-20",
+    "2026-11-22"
+  ],
+  "n_races": {
+    "train": 2868,
+    "test": 591
+  },
+  "cv_logloss": 2.0919915519253025,
+  "num_boost_round": 245,
+  "best_params": {
+    "objective": "race_softmax",
+    "metric": "None",
+    "learning_rate": 0.05,
+    "bagging_freq": 1,
+    "verbosity": -1,
+    "seed": 42,
+    "deterministic": true,
+    "force_col_wise": true,
+    "num_leaves": 9,
+    "min_child_samples": 160,
+    "feature_fraction": 0.9608988186100439,
+    "bagging_fraction": 0.6682870921364166,
+    "lambda_l1": 0.0012731251444873303,
+    "lambda_l2": 6.865817146662522
+  },
+  "test_metrics": {
+    "model": {
+      "n_races": 591,
+      "n_rows": 8010,
+      "roc_auc": 0.7890314094989564,
+      "roc_auc_by_race": 0.7708910729737843,
+      "logloss": 2.1183694321296995,
+      "brier": 0.06177995741154899,
+      "win_hit": 0.29780033840947545,
+      "winner_in_top3": 0.5922165820642978,
+      "top3_precision": 0.4827975183305132,
+      "wide_top_pair_hit": 0.2656514382402707
+    },
+    "odds_baseline": {
+      "n_races": 591,
+      "n_rows": 8010,
+      "roc_auc": 0.8349997228955973,
+      "roc_auc_by_race": 0.8153118174803753,
+      "logloss": 1.9189771603961354,
+      "brier": 0.05795973468551756,
+      "win_hit": 0.34686971235194586,
+      "winner_in_top3": 0.6395939086294417,
+      "top3_precision": 0.5279187817258884,
+      "wide_top_pair_hit": 0.34348561759729274
+    }
+  },
+  "n_unused_features": 30
+}

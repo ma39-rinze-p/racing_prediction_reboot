@@ -6,6 +6,9 @@
     win_score : モデルの出力 (各馬の強さの対数). レース内の差だけに意味がある
     p_win     : レース内でソフトマックス (exp(win_score) / Σ exp(win_score)) した 1 着になる確率.
                 作り方そのものから, レースごとの合計は必ず 1 になる
+    オッズとの差を学習したモデル (FeatureBuilder.market_offset=True):
+                win_score = モデルの出力 + log(単勝オッズから逆算した確率). モデルは「オッズがどれだけ外れているか」
+                だけを学習している (オッズは特徴量に入れず, 出発点として足す). 予測には発走前の単勝オッズが必要
     ワイドの確率: p_win を各馬の強さとする Plackett-Luce モデル (Harville モデル) でレース結果を
                   シミュレーションし, 「2 頭とも 3 着以内」になった割合を使う
 """
@@ -28,6 +31,8 @@ from racing_prediction.features.model_features import FeatureBuilder
 TOP_N = 3  # ワイドは 3 着以内
 MODEL_TARGET = "is_win"  # このコードが扱うモデルの目的変数 (metadata.json の "target")
 PROB_FLOOR = 1e-6  # logloss の計算で log(0) にならないための下限
+# 単勝オッズがない馬 (取消直後で表示がないなど) は, このオッズの馬として市場の確率を計算する
+MISSING_ODDS = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +76,33 @@ def softmax_by_race(scores: pd.Series | np.ndarray, race_ids: pd.Series | np.nda
     return (e / e.groupby(groups).transform("sum")).to_numpy()
 
 
+def market_log_prob(df: pd.DataFrame) -> np.ndarray:
+    """単勝オッズから逆算した 1 着の確率 (レース内で合計 1) の対数.
+
+    オッズとの差を学習するモデルの出発点 (LightGBM の init_score) と, オッズとの比較に使う.
+    オッズがない馬は MISSING_ODDS 倍として扱う. レースの全馬のオッズがない場合は均等.
+    """
+    odds = pd.to_numeric(df["win_odds"], errors="coerce") if "win_odds" in df else pd.Series(np.nan, index=df.index)
+    odds = odds.where(odds > 0)
+    race = df["race_id"].to_numpy()
+    has_any = odds.notna().groupby(race).transform("any").to_numpy()
+    inv = pd.Series(np.where(has_any, 1 / odds.fillna(MISSING_ODDS).to_numpy(dtype=float), 1.0), index=df.index)
+    return np.log((inv / inv.groupby(race).transform("sum")).to_numpy(dtype=float))
+
+
 def predict_win(df: pd.DataFrame, booster: lgb.Booster, builder: FeatureBuilder) -> pd.DataFrame:
     """df (make_dataset の出力と同じ列構成) に win_score, p_win, pred_rank を付けて返す.
 
     p_win はレース内のソフトマックスなので, レースごとの合計は必ず 1 になる.
+    オッズとの差を学習したモデル (builder.market_offset) では, モデルの出力に単勝オッズの確率の対数を足す
+    (df の win_odds 列が必要. 推論では発走前のオッズを入れておく).
     """
     out = df.copy()
     out["win_score"] = booster.predict(builder.transform(df), raw_score=True)
+    if getattr(builder, "market_offset", False):
+        if "win_odds" not in df or pd.to_numeric(df["win_odds"], errors="coerce").notna().sum() == 0:
+            raise ValueError("このモデルはオッズとの差を学習したモデルのため, 単勝オッズ (win_odds 列) が必要です")
+        out["win_score"] = out["win_score"].to_numpy() + market_log_prob(df)
     out["p_win"] = softmax_by_race(out["win_score"], out["race_id"])
     out["pred_rank"] = out.groupby("race_id")["p_win"].rank(ascending=False, method="first").astype(int)
     return out
@@ -231,6 +256,267 @@ def odds_baseline(df: pd.DataFrame) -> pd.DataFrame:
     return odds_implied_probabilities(df.drop(columns=["p_win", "pred_rank", "win_score"], errors="ignore"))
 
 
+def top_pick_table(pred: pd.DataFrame) -> pd.DataFrame:
+    """レースごとに, モデルの予測 1 位 (スコアがトップの馬) と 1 番人気 (単勝オッズが一番低い馬) を並べる.
+
+    pred: predict_win の出力 (結果確定済み. win_odds 列が必要)
+    列: race_id, race_venue, model_umaban / model_odds / model_win (予測 1 位の馬番 / 単勝オッズ / その馬が 1 着か),
+        fav_umaban / fav_odds / fav_win (1 番人気の馬番 / 単勝オッズ / その馬が 1 着か), same (同じ馬か)
+    1 番人気が複数 (同じオッズ) のレースは, そのうちモデルのスコアが高い方を 1 番人気とする
+    (モデルに有利にも不利にもならないよう, 同じ馬を選んでいれば「同じ」扱いにする).
+    単勝オッズがないレース (全馬取消など) は除く.
+    """
+    pred = pred[pred[TARGET_COLUMN].notna()].copy()
+    pred["_odds"] = pd.to_numeric(pred["win_odds"], errors="coerce").where(lambda o: o > 0)
+    pred = pred[pred.groupby("race_id")["_odds"].transform("count") > 0]
+    model = pred[pred["pred_rank"] == 1].set_index("race_id")
+    fav = (
+        pred.sort_values(["race_id", "_odds", "p_win"], ascending=[True, True, False])
+        .groupby("race_id").head(1).set_index("race_id")
+    )
+    out = pd.DataFrame({
+        "race_venue": model["race_venue"],
+        "model_umaban": model["umaban"],
+        "model_odds": model["_odds"],
+        "model_win": model[TARGET_COLUMN].astype(int),
+    })
+    out["fav_umaban"] = fav["umaban"].reindex(out.index)
+    out["fav_odds"] = fav["_odds"].reindex(out.index)
+    out["fav_win"] = fav[TARGET_COLUMN].astype(int).reindex(out.index)
+    out["same"] = out["model_umaban"] == out["fav_umaban"]
+    return out.reset_index()
+
+
+def compare_top_pick(pred: pd.DataFrame, n_bootstrap: int = 2000, seed: int = 0) -> dict:
+    """「スコアがトップの馬が 1 着になった割合」と「単勝オッズが一番低い馬 (1 番人気) が 1 着になった割合」を比べる.
+
+    n_races        : 比べたレース数
+    model_hit      : 予測 1 位の馬が 1 着だった割合
+    favorite_hit   : 1 番人気の馬が 1 着だった割合
+    diff           : model_hit - favorite_hit (プラスならモデルの方が当たる)
+    diff_ci_low / diff_ci_high: diff の 95% 信頼区間 (レースを復元抽出するブートストラップ). 0 をまたげば「差があるとは言えない」
+    p_value        : 差の検定 (マクネマー検定. 片方だけが当たったレースの数を比べる) の p 値
+    same_rate      : 予測 1 位と 1 番人気が同じ馬だった割合
+    n_model_only / n_favorite_only: 予測 1 位だけが当たった / 1 番人気だけが当たったレース数
+    hit_when_same  : 同じ馬だったレースでの的中率
+    model_hit_when_diff / favorite_hit_when_diff: 違う馬だったレースでの, それぞれの的中率
+    単勝 100 円ずつ買った場合 (払戻 = 単勝オッズ x 100 円. 予測 1 位の単勝オッズがない場合は払戻 0 円):
+    bet_per_race   : 1 レースあたりの賭け金 (100 円)
+    model_profit / favorite_profit: 予測 1 位 / 1 番人気 に賭けた場合の総利益 (払戻の合計 - 賭け金の合計. 円)
+    model_return / favorite_return: 回収率 (払戻の合計 / 賭け金の合計. 1.0 で元が取れる)
+    return_diff    : model_return - favorite_return
+    return_diff_ci_low / return_diff_ci_high: return_diff の 95% 信頼区間 (ブートストラップ)
+    """
+    from scipy.stats import binomtest
+
+    t = top_pick_table(pred)
+    if t.empty:
+        return {"n_races": 0}
+    m, f = t["model_win"].to_numpy(), t["fav_win"].to_numpy()
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(t), size=(n_bootstrap, len(t)))
+    diffs = m[idx].mean(axis=1) - f[idx].mean(axis=1)
+    bet = 100
+    # 払戻 (円). 単勝オッズ (例 3.5) x 100 円
+    m_pay = np.where(m == 1, t["model_odds"].fillna(0).to_numpy() * bet, 0.0)
+    f_pay = np.where(f == 1, t["fav_odds"].fillna(0).to_numpy() * bet, 0.0)
+    return_diffs = (m_pay[idx].mean(axis=1) - f_pay[idx].mean(axis=1)) / bet
+    model_only, fav_only = int(((m == 1) & (f == 0)).sum()), int(((m == 0) & (f == 1)).sum())
+    discordant = model_only + fav_only
+    same, diff = t["same"].to_numpy(), ~t["same"].to_numpy()
+    return {
+        "n_races": int(len(t)),
+        "model_hit": float(m.mean()),
+        "favorite_hit": float(f.mean()),
+        "diff": float(m.mean() - f.mean()),
+        "diff_ci_low": float(np.quantile(diffs, 0.025)),
+        "diff_ci_high": float(np.quantile(diffs, 0.975)),
+        "p_value": float(binomtest(model_only, discordant, 0.5).pvalue) if discordant else 1.0,
+        "same_rate": float(same.mean()),
+        "n_model_only": model_only,
+        "n_favorite_only": fav_only,
+        "hit_when_same": float(m[same].mean()) if same.any() else float("nan"),
+        "model_hit_when_diff": float(m[diff].mean()) if diff.any() else float("nan"),
+        "favorite_hit_when_diff": float(f[diff].mean()) if diff.any() else float("nan"),
+        "bet_per_race": bet,
+        "model_profit": float(m_pay.sum() - bet * len(t)),
+        "favorite_profit": float(f_pay.sum() - bet * len(t)),
+        "model_return": float(m_pay.mean() / bet),
+        "favorite_return": float(f_pay.mean() / bet),
+        "return_diff": float((m_pay.mean() - f_pay.mean()) / bet),
+        "return_diff_ci_low": float(np.quantile(return_diffs, 0.025)),
+        "return_diff_ci_high": float(np.quantile(return_diffs, 0.975)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# オッズとの比較: モデルを混ぜるとオッズ単体より当たるか (メインの目標)
+# ---------------------------------------------------------------------------
+def _race_arrays(race_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """同じレースが連続して並んだ race_ids から, 各レースの先頭行と各行のレース番号を作る."""
+    starts = np.flatnonzero(np.r_[True, race_ids[1:] != race_ids[:-1]])
+    gid = np.cumsum(np.r_[True, race_ids[1:] != race_ids[:-1]]) - 1
+    return starts, gid
+
+
+def _blend_probs(w: np.ndarray, x: np.ndarray, starts: np.ndarray, gid: np.ndarray) -> np.ndarray:
+    s = x @ w
+    e = np.exp(s - np.maximum.reduceat(s, starts)[gid])
+    return e / np.add.reduceat(e, starts)[gid]
+
+
+def _fit_blend(x: np.ndarray, y: np.ndarray, starts: np.ndarray, gid: np.ndarray) -> tuple[np.ndarray, float]:
+    """条件付きロジット s = x @ w (レース内ソフトマックス) を最尤推定する. (w, レースあたりの負の対数尤度) を返す.
+
+    y はレース内で合計 1 の正解 (同着は等分).
+    """
+    from scipy.optimize import minimize
+
+    n_races = len(starts)
+
+    def nll(w):
+        p = _blend_probs(w, x, starts, gid)
+        loss = -(y * np.log(np.clip(p, PROB_FLOOR, None))).sum() / n_races
+        grad = -((y - p)[:, None] * x).sum(axis=0) / n_races
+        return loss, grad
+
+    res = minimize(nll, np.ones(x.shape[1]), jac=True, method="L-BFGS-B")
+    return res.x, float(res.fun)
+
+
+def compare_with_market(pred: pd.DataFrame, n_bootstrap: int = 2000, seed: int = 0, value_threshold: float = 1.0) -> dict:
+    """モデルの予測をオッズと混ぜると, オッズ単体より当たるか (= モデルにオッズにない情報があるか) を調べる.
+
+    混ぜ方: 各馬のスコア = a × log(モデルの確率) + b × log(単勝オッズの確率) をレース内でソフトマックスする
+    (条件付きロジット. a, b は最尤推定). a > 0 で, 混ぜた予測がオッズ単体より当たれば, モデルはオッズにない情報を持っている.
+    比べる相手の「オッズ単体」は, そのままのオッズと, b × log(単勝オッズの確率) で補正したもの (b だけ推定) の
+    うち logloss が良い方にする (オッズは人気薄が過大評価されやすく, 補正しただけで良くなる分をモデルの手柄にしないため.
+    レースが少ないと補正が逆効果になることもあるので, 良い方を使う = モデルに厳しい比べ方).
+    a, b を決めたのと同じレースで評価すると甘くなるので, テスト期間を前半・後半に分け,
+    片方で a, b を決めてもう片方を予測する (交差して両方を予測する).
+
+    pred: predict_win の出力 (結果確定済み. win_odds 列が必要)
+    n_races          : 比べたレース数 (1 着がいて, 単勝オッズがあるレース)
+    model_weight / market_weight: テスト期間全体で推定した a (モデルの重み) / b (オッズの重み)
+    model_weight_p_value: a = 0 (モデルを混ぜても良くならない) の検定 (尤度比検定, 片側) の p 値
+    market_logloss / model_logloss / blend_logloss: レース単位の logloss (オッズ単体 / モデル単体 / 混ぜた予測)
+    raw_market_logloss / calibrated_market_logloss: そのままのオッズ / 補正したオッズの logloss (良い方が market_logloss)
+    logloss_gain     : market_logloss - blend_logloss (プラスなら混ぜた方が当たる. メインの目標)
+    logloss_gain_ci_low / logloss_gain_ci_high: logloss_gain の 95% 信頼区間 (レースを復元抽出するブートストラップ)
+    model_gain / model_gain_ci_low / model_gain_ci_high: market_logloss - model_logloss とその 95% 信頼区間
+        (オッズとの差を学習したモデルは, モデル単体がすでにオッズと混ざった予測)
+    market_hit / model_hit / blend_hit: それぞれの予測 1 位の馬が 1 着だった割合 (オッズの 1 位 = 1 番人気)
+    blend_hit_diff   : blend_hit - market_hit
+    value_threshold  : 期待値 (混ぜた予測の確率 × 単勝オッズ) がこれを超える馬を「買う」
+    n_value_bets / value_bet_return: その馬の単勝を 100 円ずつ買った数と回収率
+    goal_met         : 目標を達成したか (混ぜた予測かモデル単体が, オッズ単体より当たる = 改善の 95% 信頼区間が 0 より上)
+    """
+    from scipy.stats import chi2
+
+    d = pred[pred[TARGET_COLUMN].notna() & pred["p_win"].notna()].copy()
+    d = d[d["race_id"].isin(_races_with_winner(d))]
+    odds = pd.to_numeric(d.get("win_odds"), errors="coerce").where(lambda o: o > 0)
+    d = d[odds.notna().groupby(d["race_id"]).transform("any")]
+    if d.empty:
+        return {"n_races": 0}
+    d = d.sort_values(["race_date", "race_id", "umaban"], kind="stable").reset_index(drop=True)
+    race_ids = d["race_id"].to_numpy()
+    starts, gid = _race_arrays(race_ids)
+    win = d[TARGET_COLUMN].astype(int).to_numpy()
+    y = win / np.add.reduceat(win, starts)[gid]
+    lp = np.log(np.clip(d["p_win"].to_numpy(dtype=float), PROB_FLOOR, None))
+    lq = market_log_prob(d)
+    x = np.column_stack([lp, lq])
+
+    # テスト期間全体での重みと, a = 0 の尤度比検定
+    w_full, nll_full = _fit_blend(x, y, starts, gid)
+    _, nll_market = _fit_blend(x[:, [1]], y, starts, gid)
+    stat = max(0.0, 2 * (nll_market - nll_full) * len(starts))
+    p_two = float(chi2.sf(stat, 1))
+    p_value = p_two / 2 if w_full[0] > 0 else 1 - p_two / 2
+
+    # 前半・後半で交差して, 決めた重みを使っていない方のレースを予測する
+    race_dates = d["race_date"].to_numpy()[starts]
+    first = race_dates < race_dates[len(starts) // 2]  # 同じ開催日のレースは同じ側に入れる
+    if first.all() or not first.any():
+        first = np.arange(len(starts)) < len(starts) // 2
+    row_first = first[gid]
+    pb, pm = np.zeros(len(d)), np.zeros(len(d))  # 混ぜた予測 / 補正したオッズ
+    for fit_rows, pred_rows in ((row_first, ~row_first), (~row_first, row_first)):
+        fs, fg = _race_arrays(race_ids[fit_rows])
+        ps, pg = _race_arrays(race_ids[pred_rows])
+        w, _ = _fit_blend(x[fit_rows], y[fit_rows], fs, fg)
+        pb[pred_rows] = _blend_probs(w, x[pred_rows], ps, pg)
+        w, _ = _fit_blend(x[fit_rows][:, [1]], y[fit_rows], fs, fg)
+        pm[pred_rows] = _blend_probs(w, x[pred_rows][:, [1]], ps, pg)
+
+    q = np.exp(lq)
+    p_model = np.exp(lp) / np.add.reduceat(np.exp(lp), starts)[gid]
+
+    def race_loss(p):
+        return -np.log(np.clip(np.add.reduceat(p * (win == 1), starts), PROB_FLOOR, None))
+
+    loss_raw, loss_cal = race_loss(q), race_loss(pm)
+    loss_market = loss_raw if loss_raw.mean() <= loss_cal.mean() else loss_cal
+    loss_model, loss_blend = race_loss(p_model), race_loss(pb)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(starts), size=(n_bootstrap, len(starts)))
+
+    def gain_ci(gain):
+        gains = gain[idx].mean(axis=1)
+        return float(gain.mean()), float(np.quantile(gains, 0.025)), float(np.quantile(gains, 0.975))
+
+    blend_gain, blend_low, blend_high = gain_ci(loss_market - loss_blend)
+    model_gain, model_low, model_high = gain_ci(loss_market - loss_model)
+
+    def top_hit(score):
+        # レース内で score が最大の馬 (同じならモデルの確率が高い方) が 1 着か
+        order = np.lexsort((-p_model, -score, gid))
+        top_rows = order[np.r_[True, gid[order][1:] != gid[order][:-1]]]
+        return float(win[top_rows].mean())
+
+    odds_v = pd.to_numeric(d["win_odds"], errors="coerce").where(lambda o: o > 0).to_numpy()
+    value = (pb * np.nan_to_num(odds_v, nan=0.0)) > value_threshold
+    n_value = int(value.sum())
+    market_hit, blend_hit = top_hit(q), top_hit(pb)
+    return {
+        "n_races": int(len(starts)),
+        "model_weight": float(w_full[0]),
+        "market_weight": float(w_full[1]),
+        "model_weight_p_value": float(p_value),
+        "market_logloss": float(loss_market.mean()),
+        "raw_market_logloss": float(loss_raw.mean()),
+        "calibrated_market_logloss": float(loss_cal.mean()),
+        "model_logloss": float(loss_model.mean()),
+        "blend_logloss": float(loss_blend.mean()),
+        "logloss_gain": blend_gain,
+        "logloss_gain_ci_low": blend_low,
+        "logloss_gain_ci_high": blend_high,
+        "model_gain": model_gain,
+        "model_gain_ci_low": model_low,
+        "model_gain_ci_high": model_high,
+        "market_hit": market_hit,
+        "model_hit": top_hit(p_model),
+        "blend_hit": blend_hit,
+        "blend_hit_diff": blend_hit - market_hit,
+        "value_threshold": value_threshold,
+        "n_value_bets": n_value,
+        "value_bet_return": float((win[value] * odds_v[value]).sum() / n_value) if n_value else float("nan"),
+        "goal_met": bool(blend_low > 0 or model_low > 0),
+    }
+
+
+def market_blend_verdict(r: dict) -> str:
+    """compare_with_market の結果を一言で表す."""
+    if not r.get("n_races"):
+        return "比べられるレースがありません"
+    if r.get("goal_met"):
+        return "目標達成: モデルを混ぜるとオッズ単体より当たる (モデルにオッズにない情報がある)"
+    if max(r.get("logloss_gain") or 0, r.get("model_gain") or 0) > 0:
+        return "目標未達: オッズよりわずかに良いが, 偶然の範囲を出ない"
+    return "目標未達: オッズ単体の方が当たる (モデルにオッズにない情報はまだない)"
+
+
 def calibration_table(pred: pd.DataFrame, prob_col: str = "p_win") -> pd.DataFrame:
     """予測確率の帯ごとに, 平均予測確率と実際の 1 着率を比べる (ずれが小さいほど良い).
 
@@ -245,6 +531,83 @@ def calibration_table(pred: pd.DataFrame, prob_col: str = "p_win") -> pd.DataFra
         .agg(n=(prob_col, "size"), mean_pred=(prob_col, "mean"), actual_rate=("_y", "mean"))
         .reset_index(names="p_win_bin")
     )
+
+
+def calibration_bins(
+    pred: pd.DataFrame, prob_col: str = "p_win", n_bins: int = 10, method: str = "quantile"
+) -> pd.DataFrame:
+    """スコア (1 着の確率) を n_bins 個の帯に分け, 帯ごとにスコアの平均と実際の 1 着率を比べる.
+
+    method:
+        "quantile": スコアの低い順に並べ, 頭数が同じになるように n_bins 等分する (既定. 1 着の確率は低い馬が
+                    ほとんどなので, 低い確率のところも細かく見られる. どの帯も頭数が同じなのでぶれの大きさも揃う)
+        "width"   : スコアの値で 0-10%, 10-20%, ... と等間隔に分ける (高い帯は馬が少ない)
+    列: bin ("quantile" なら 1〜n_bins. 1 がスコアの最も低い帯 / "width" なら "10-20%" など),
+        range (帯のスコアの範囲. 例 "1.2%〜2.5%"), n (馬の数), mean_score (スコアの平均), win_rate (実際の 1 着率),
+        diff (win_rate - mean_score. プラスならスコアが低すぎ = 過小評価, マイナスなら過大評価),
+        ci_low / ci_high (実際の 1 着率の 95% 信頼区間. Wilson 法. 馬が少ない帯ほど広い)
+    馬がいない帯は n = 0 で, ほかの列は欠損.
+    """
+    if method not in ("quantile", "width"):
+        raise ValueError(f"method は 'quantile' か 'width' にしてください: {method}")
+    pred = pred[pred[TARGET_COLUMN].notna() & pred[prob_col].notna()]
+    score = pred[prob_col].clip(0, 1).to_numpy(dtype=float)
+    y = pred[TARGET_COLUMN].astype(float).to_numpy()
+    if method == "quantile":
+        # 同じスコアの馬が帯の境目をまたいでも頭数が揃うよう, 順位 (同じ値は出てきた順) で分ける
+        order = np.argsort(score, kind="stable")
+        idx = np.empty(len(score), dtype=int)
+        idx[order] = np.arange(len(score)) * n_bins // max(len(score), 1)
+    else:
+        idx = np.minimum((score * n_bins + 1e-9).astype(int), n_bins - 1)
+    rows = []
+    for k in range(n_bins):
+        mask = idx == k
+        n = int(mask.sum())
+        label = str(k + 1) if method == "quantile" else f"{round(k * 100 / n_bins)}-{round((k + 1) * 100 / n_bins)}%"
+        row = {"bin": label, "range": f"{score[mask].min():.1%}〜{score[mask].max():.1%}" if n else "-", "n": n,
+               "mean_score": np.nan, "win_rate": np.nan, "diff": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+        if n:
+            rate = float(y[mask].mean())
+            z = 1.96  # Wilson の 95% 信頼区間
+            center = (rate + z * z / (2 * n)) / (1 + z * z / n)
+            half = z * np.sqrt(rate * (1 - rate) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+            row.update(mean_score=float(score[mask].mean()), win_rate=rate, ci_low=center - half, ci_high=center + half)
+            row["diff"] = rate - row["mean_score"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def calibration_summary(bins: pd.DataFrame) -> dict:
+    """calibration_bins の結果のまとめ.
+
+    ece          : 帯ごとの |実際の 1 着率 - スコアの平均| を馬の数で重み付けした平均 (Expected Calibration Error. 小さいほど良い)
+    max_abs_diff : |差| の最大 (馬が 30 頭以上の帯だけ. 少ない帯は偶然のぶれが大きいため)
+    n_outside_ci : スコアの平均が実際の 1 着率の 95% 信頼区間の外にある帯の数 (偶然では説明しにくいずれ)
+    bins         : 帯ごとの表 (calibration_bins の行)
+    """
+    b = bins[bins["n"] > 0]
+    enough = b[b["n"] >= 30]
+    outside = (b["mean_score"] < b["ci_low"]) | (b["mean_score"] > b["ci_high"])
+    return {
+        "ece": float((b["diff"].abs() * b["n"]).sum() / b["n"].sum()) if len(b) else float("nan"),
+        "max_abs_diff": float(enough["diff"].abs().max()) if len(enough) else float("nan"),
+        "n_outside_ci": int(outside.sum()),
+        "bins": json.loads(bins.to_json(orient="records")),
+    }
+
+
+def compare_calibration(pred: pd.DataFrame, n_bins: int = 10, method: str = "quantile") -> dict:
+    """モデルのスコアと, 単勝オッズから逆算した確率のそれぞれで, 帯ごとのスコアの平均と実際の 1 着率を比べる.
+
+    既定は頭数が同じになるように 10 等分する (calibration_bins の method). 帯はそれぞれのスコアで別々に分ける.
+    {"method": ..., "n_bins": ..., "model": calibration_summary(...), "odds": calibration_summary(...)}
+    """
+    out = {"method": method, "n_bins": n_bins,
+           "model": calibration_summary(calibration_bins(pred, n_bins=n_bins, method=method))}
+    if "win_odds" in pred:
+        out["odds"] = calibration_summary(calibration_bins(odds_baseline(pred), n_bins=n_bins, method=method))
+    return out
 
 
 def feature_importance(

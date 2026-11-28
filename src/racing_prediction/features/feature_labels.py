@@ -65,11 +65,6 @@ BASE_LABELS = {
     "hist_surface_change": "前走から芝・ダートが変わったか",
     "hist_jockey_change": "前走から騎手が変わったか",
     "hist_weight_carried_diff": "前走からの斤量の変化",
-    # 単勝オッズ (model_features)
-    "odds_log": "単勝オッズ(対数)",
-    "odds_prob": "単勝オッズから見た1着の確率",
-    "odds_rank": "単勝人気(オッズの順位)",
-    "odds_log_minus_hist": "単勝オッズ(対数)-直近3走の平均(人気の変化)",
     # スピード指数 (model_features)
     "speed_last1": "前走のスピード指数",
     "speed_best3": "直近3走のスピード指数の最高",

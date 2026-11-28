@@ -19,8 +19,7 @@ netkeiba から取得した出馬表・結果・過去戦績・血統をもと�
                CSV には保存せず, 読み込み時に着順 (rank) から作る (add_win_label)
     参考     : rank (着順), is_top3 (3 着以内なら 1. ワイドの評価に使う. CSV に保存する)
     オッズ   : win_odds (単勝オッズ), popularity (人気). CSV には確定オッズを保存する
-               win_odds はモデルの特徴量に使う (model_features の odds_*). 学習では確定オッズ,
-               推論では推論時点 (発走 12 分前) に取得したオッズで置き換える (inference/run.py)
+               オッズに関する情報はモデルの特徴量に使わない (精度の比較用. model_features.ODDS_COLUMNS も参照)
 """
 
 from __future__ import annotations
@@ -75,7 +74,7 @@ TARGET_COLUMN = "is_win"
 # 3 着以内か否か (CSV に保存する. ワイドの評価に使う)
 TOP3_COLUMN = "is_top3"
 
-# 結果の列 (着順と確定オッズ・人気. win_odds は model_features でオッズの特徴量にする. 推論時は推論時点のオッズ)
+# 結果の列 (着順と確定オッズ・人気. オッズ・人気は特徴量に使わず, 精度の比較 (参考) に使う)
 RESULT_COLUMNS = ["rank", "win_odds", "popularity"]
 
 # 出走しなかった馬 (着順欄がこれらの場合はテーブルから除く)

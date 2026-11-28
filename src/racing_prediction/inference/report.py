@@ -116,7 +116,7 @@ def format_race_report(
     if pred["horse_weight"].isna().all():
         lines += ["※ 馬体重が未発表の状態で予測しています", ""]
     if race_info.get("win_odds_note"):
-        lines += [f"※ 予測には単勝オッズ ({race_info['win_odds_note']}) を使っています", ""]
+        lines += [f"※ 単勝オッズ ({race_info['win_odds_note']}) を出発点にして予測しています", ""]
 
     box_lines, n_positive = _box_lines(boxes, n_boxes_total, max_display, odds_note)
     lines += box_lines + [""]
