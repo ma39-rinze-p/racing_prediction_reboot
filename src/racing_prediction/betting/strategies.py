@@ -114,6 +114,29 @@ def model_ticket_probs(bet: BetType, race: pd.DataFrame, orders: np.ndarray) -> 
     return {tuple(int(x) for x in key): c / n_sims for key, c in zip(keys, counts)}
 
 
+def _capped_shares(weights: np.ndarray, total: float) -> np.ndarray:
+    """weights に比例し, 合計が total になる確率. ただし 1 を超える点は 1 にし, 余った分をほかの点に比例して配り直す.
+
+    複勝・ワイドは当たりが複数 (合計 3) なので, 単純に比例配分すると, 圧倒的な人気馬 (複勝 1.1 倍など) の確率が
+    1 を超えてしまう (確率は 1 を超えないので, 期待払戻がオッズ × 100 円を超えるという矛盾が起きる).
+    """
+    w = np.asarray(weights, dtype=float)
+    p = np.zeros_like(w)
+    capped = np.zeros(len(w), dtype=bool)
+    for _ in range(len(w) + 1):
+        free = ~capped
+        rest = total - capped.sum()
+        if rest <= 0 or w[free].sum() <= 0:
+            break
+        p[free] = w[free] / w[free].sum() * rest
+        p[capped] = 1.0
+        over = free & (p > 1.0)
+        if not over.any():
+            break
+        capped |= over
+    return np.clip(p, 0.0, 1.0)
+
+
 def ticket_table(bet: BetType, odds: pd.DataFrame, p_model: dict[tuple, float], cfg: BetTypeConfig, n_horses: int) -> pd.DataFrame:
     """発売中の各点 (オッズがある組み合わせ) の p_model, p_market, p_used, 期待値を計算する.
 
@@ -126,8 +149,11 @@ def ticket_table(bet: BetType, odds: pd.DataFrame, p_model: dict[tuple, float], 
     t = t.drop_duplicates("combo").reset_index(drop=True)
     t["p_model"] = [p_model.get(c, 0.0) for c in t["combo"]]
     inv = 1 / ((t["odds_min"] + t["odds_max"]) / 2)
-    t["p_market"] = inv / inv.sum() * min(_winning_tickets(bet, n_horses), len(t))
-    blended = np.exp((1 - cfg.market_weight) * np.log(t["p_model"].clip(lower=1e-9)) + cfg.market_weight * np.log(t["p_market"]))
+    # 合計を当たりの点数に揃える (1 点で 1 を超える分は, ほかの点に配り直す)
+    t["p_market"] = _capped_shares(inv.to_numpy(), min(_winning_tickets(bet, n_horses), len(t)))
+    blended = np.exp((1 - cfg.market_weight) * np.log(t["p_model"].clip(lower=1e-9))
+                     + cfg.market_weight * np.log(t["p_market"].clip(lower=1e-12)))
+    blended = np.clip(blended, 0.0, 1.0)  # 確率は 1 を超えない (= 期待払戻はオッズ × 100 円を超えない)
     t["trust_model"] = (t["odds_min"] <= cfg.max_odds) & (t["p_model"] >= cfg.min_model_prob)
     t["p_used"] = np.where(t["trust_model"], blended, t["p_market"])
     t["exp_return"] = t["p_used"] * t["odds_min"]
