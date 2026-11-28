@@ -35,13 +35,33 @@ SLEEP_MIN_SEC = 1.0
 SLEEP_MAX_SEC = 3.0
 
 
+_HEADER_CHARSET = re.compile(r"charset=[\"']?([\w-]+)", re.IGNORECASE)
+_META_CHARSET = re.compile(rb"<meta[^>]+charset=[\"']?([\w-]+)", re.IGNORECASE)
+
+
+def detect_encoding(response: requests.Response) -> str:
+    """ページの文字コード. ページが宣言している文字コード (HTTP ヘッダ → HTML の meta タグ) を優先し,
+    宣言がないときだけ中身から推定する (apparent_encoding).
+
+    netkeiba は UTF-8 のページと EUC-JP のページが混在する. 中身からの推定は, 日本語が少ないページなどで
+    外れることがある (例: UTF-8 の競走成績ページを mac_latin2 と推定し, 見出しの「日付」が文字化けして読めなくなった).
+    """
+    m = _HEADER_CHARSET.search(response.headers.get("Content-Type", ""))
+    if m:
+        return m.group(1)
+    m = _META_CHARSET.search(response.content[:10000])
+    if m:
+        return m.group(1).decode("ascii")
+    return response.apparent_encoding or "utf-8"
+
+
 def polite_get(url: str, params: dict | None = None, timeout: int = 10) -> requests.Response:
     """User-Agent 付きで GET し, アクセスのたびに 1〜3 秒ランダムに待機する."""
     try:
         response = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
         response.raise_for_status()
-        # netkeiba は EUC-JP のページもあるため, 実際の文字コードを推定させる
-        response.encoding = response.apparent_encoding
+        # netkeiba は UTF-8 と EUC-JP のページが混在するため, ページが宣言している文字コードで読む
+        response.encoding = detect_encoding(response)
         return response
     finally:
         # 成功・失敗にかかわらず必ず待機する (サーバー負荷軽減)
