@@ -9,6 +9,15 @@
     オッズとの差を学習したモデル (FeatureBuilder.market_offset=True):
                 win_score = モデルの出力 + log(単勝オッズから逆算した確率). モデルは「オッズがどれだけ外れているか」
                 だけを学習している (オッズは特徴量に入れず, 出発点として足す). 予測には発走前の単勝オッズが必要
+    3 着以内のモデル (任意. model_top3.txt):
+                p_top3 = 各馬が 3 着以内に入る確率 (二値分類のロジットをシグモイドで確率にする).
+                オッズとの差を学習したモデルでは, 単勝オッズから Harville モデルで計算した 3 着以内の確率の
+                ロジットを出発点にする
+    着順のシミュレーション (simulate_orders):
+                1 着は p_win の確率で選び, 2・3 着は残りの馬から「2・3 着用の強さ」に比例した確率で選ぶ.
+                3 着以内のモデルがあれば, 各馬の 3 着以内の確率が p_top3 に合うように 2・3 着用の強さを調整する
+                (1 着の確率は p_win のまま). なければ 2・3 着用の強さも p_win (Harville モデル).
+                ここから単勝・複勝・ワイド・3 連複・3 連単の確率が全部出せる
     ワイドの確率: p_win を各馬の強さとする Plackett-Luce モデル (Harville モデル) でレース結果を
                   シミュレーションし, 「2 頭とも 3 着以内」になった割合を使う
 """
@@ -30,6 +39,9 @@ from racing_prediction.features.model_features import FeatureBuilder
 
 TOP_N = 3  # ワイドは 3 着以内
 MODEL_TARGET = "is_win"  # このコードが扱うモデルの目的変数 (metadata.json の "target")
+TOP3_MODEL_TARGET = "is_top3"  # 3 着以内のモデルの目的変数 (metadata_top3.json の "target")
+TOP3_MODEL_FILE = "model_top3.txt"
+TOP3_METADATA_FILE = "metadata_top3.json"
 PROB_FLOOR = 1e-6  # logloss の計算で log(0) にならないための下限
 # 単勝オッズがない馬 (取消直後で表示がないなど) は, このオッズの馬として市場の確率を計算する
 MISSING_ODDS = 300.0
@@ -57,12 +69,26 @@ def load_artifacts(model_dir: str | Path) -> tuple[lgb.Booster, FeatureBuilder, 
             f"{model_dir} のモデルは目的変数が {target} のため使えません (1 着の確率を予測するモデル ({MODEL_TARGET}) が必要). "
             "python scripts/train_on_kaggle.py --update-dataset で学習し直してください."
         )
-    # model.txt は各木の長さをバイト数で持つため, Windows の git (core.autocrlf=true) などで改行が CRLF に
-    # 変換されると "Model format error" で読めなくなる. 改行を LF に揃えてから読み込む
-    model_str = (model_dir / "model.txt").read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
-    booster = lgb.Booster(model_str=model_str)
+    booster = _read_booster(model_dir / "model.txt")
     builder = FeatureBuilder.from_dict(metadata["feature_builder"])
     return booster, builder, metadata
+
+
+def _read_booster(path: Path) -> lgb.Booster:
+    # model.txt は各木の長さをバイト数で持つため, Windows の git (core.autocrlf=true) などで改行が CRLF に
+    # 変換されると "Model format error" で読めなくなる. 改行を LF に揃えてから読み込む
+    return lgb.Booster(model_str=Path(path).read_bytes().replace(b"\r\n", b"\n").decode("utf-8"))
+
+
+def load_top3_artifacts(model_dir: str | Path) -> tuple[lgb.Booster, FeatureBuilder, dict] | None:
+    """3 着以内のモデル (model_top3.txt, metadata_top3.json) を読み込む. なければ None (1 着のモデルだけで予測する)."""
+    model_dir = Path(model_dir)
+    if not (model_dir / TOP3_MODEL_FILE).exists() or not (model_dir / TOP3_METADATA_FILE).exists():
+        return None
+    metadata = json.loads((model_dir / TOP3_METADATA_FILE).read_text(encoding="utf-8"))
+    if metadata.get("target") != TOP3_MODEL_TARGET:
+        raise ValueError(f"{model_dir / TOP3_METADATA_FILE} は 3 着以内のモデルではありません (target: {metadata.get('target')})")
+    return _read_booster(model_dir / TOP3_MODEL_FILE), FeatureBuilder.from_dict(metadata["feature_builder"]), metadata
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +134,60 @@ def predict_win(df: pd.DataFrame, booster: lgb.Booster, builder: FeatureBuilder)
     return out
 
 
+def market_top3_prob(df: pd.DataFrame) -> np.ndarray:
+    """単勝オッズから逆算した 1 着の確率 (market_log_prob) を各馬の強さとする Harville モデルで計算した,
+    各馬が 3 着以内に入る確率 (レース内の合計は min(3, 頭数)). 3 着以内のモデルの出発点と比較に使う.
+
+    P(i が 3 着以内) = P(1 着) + P(2 着) + P(3 着)
+        P(2 着) = Σ_j p_j × p_i / (1 - p_j)
+        P(3 着) = Σ_{j, k} p_j × p_k / (1 - p_j) × p_i / (1 - p_j - p_k)   (j, k, i はすべて別の馬)
+    """
+    q = np.exp(market_log_prob(df))
+    out = np.ones(len(df))
+    groups = pd.DataFrame({"race": df["race_id"].to_numpy()}).groupby("race", sort=False).indices
+    for idx in groups.values():
+        p = q[idx]
+        if len(p) <= 3:
+            continue  # 3 頭以下なら全馬 3 着以内
+        a = p / np.clip(1 - p, 1e-12, None)
+        p2 = p * (a.sum() - a)
+        m = np.outer(a, p)  # m[j, k] = j が 1 着で k が 2 着の確率
+        np.fill_diagonal(m, 0.0)
+        t = m / np.clip(1 - p[:, None] - p[None, :], 1e-12, None)
+        np.fill_diagonal(t, 0.0)
+        p3 = p * (t.sum() - t.sum(axis=1) - t.sum(axis=0))
+        out[idx] = np.clip(p + p2 + p3, 0.0, 1.0)
+    return out
+
+
+def _logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=float), PROB_FLOOR, 1 - PROB_FLOOR)
+    return np.log(p / (1 - p))
+
+
+def market_top3_logit(df: pd.DataFrame) -> np.ndarray:
+    """market_top3_prob のロジット (3 着以内のモデルの出発点. LightGBM の init_score)."""
+    return _logit(market_top3_prob(df))
+
+
+def predict_top3(df: pd.DataFrame, booster: lgb.Booster, builder: FeatureBuilder) -> pd.DataFrame:
+    """3 着以内のモデルで, df に top3_score (ロジット), p_top3 (3 着以内に入る確率), top3_rank を付けて返す.
+
+    オッズとの差を学習したモデル (builder.market_offset) では, 単勝オッズから計算した 3 着以内の確率の
+    ロジットを足す (df の win_odds 列が必要).
+    """
+    out = df.copy()
+    score = booster.predict(builder.transform(df), raw_score=True)
+    if getattr(builder, "market_offset", False):
+        if "win_odds" not in df or pd.to_numeric(df["win_odds"], errors="coerce").notna().sum() == 0:
+            raise ValueError("このモデルはオッズとの差を学習したモデルのため, 単勝オッズ (win_odds 列) が必要です")
+        score = score + market_top3_logit(df)
+    out["top3_score"] = score
+    out["p_top3"] = 1 / (1 + np.exp(-score))
+    out["top3_rank"] = out.groupby("race_id")["p_top3"].rank(ascending=False, method="first").astype(int)
+    return out
+
+
 def odds_implied_probabilities(df: pd.DataFrame) -> pd.DataFrame:
     """確定単勝オッズから逆算した 1 着の確率 (比較用. モデルの特徴量には使わない).
 
@@ -123,26 +203,98 @@ def odds_implied_probabilities(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def simulate_top3(race: pd.DataFrame, n_sims: int = 20000, seed: int = 0) -> np.ndarray:
-    """1 レース分の予測 (predict_win の出力) から, レース結果を n_sims 回シミュレーションする.
+def _top3_target(p_win: np.ndarray, p_top3: np.ndarray) -> np.ndarray:
+    """3 着以内のモデルの確率を, シミュレーションで再現できる形に整える.
 
-    p_win を各馬の強さとする Plackett-Luce モデル (Harville モデル) に従う:
-    1 着は p_win の確率で選ばれ, 2 着以降は残った馬の中で強さに比例した確率で選ばれる.
-    (log(強さ) に Gumbel ノイズを加えて並べ替えると Plackett-Luce の着順サンプルになる)
+    各馬で p_win 以上 1 以下にし, レース内の合計が 3 (頭数が 3 以下なら頭数) になるよう,
+    「3 着以内の確率 - 1 着の確率」(2・3 着に入る分) を同じ比率で伸縮する.
+    """
+    n = len(p_win)
+    total = min(TOP_N, n)
+    target = np.clip(np.nan_to_num(p_top3, nan=0.0), p_win, 1.0)
+    for _ in range(20):
+        extra = target - p_win
+        free = target < 1.0 - 1e-12
+        need = total - target.sum()
+        if abs(need) < 1e-9 or extra[free].sum() <= 0:
+            break
+        target = np.where(free, np.clip(p_win + extra * (1 + need / extra[free].sum()), p_win, 1.0), target)
+    return target
+
+
+def simulate_orders(
+    race: pd.DataFrame,
+    n_sims: int = 20000,
+    seed: int = 0,
+    p_top3: np.ndarray | None = None,
+    n_iter: int = 50,
+    tol: float = 0.002,
+) -> np.ndarray:
+    """1 レース分の予測から, 1〜3 着の着順を n_sims 回シミュレーションする.
+
+    1 着: p_win の確率で選ぶ (Plackett-Luce の 1 段目)
+    2・3 着: 残りの馬から, 2・3 着用の強さ w に比例した確率で順に選ぶ.
+        p_top3 (3 着以内のモデルの確率. race と同じ行の順) を渡せば, 各馬の 3 着以内の割合が p_top3 に合うよう
+        w を調整する (同じ乱数のまま, ずれの比で w を掛け直すのを繰り返す). 渡さなければ w = p_win (Harville モデル).
+    log(強さ) に Gumbel ノイズを加えて大きい順に選ぶと, 強さに比例した確率で選んだことになる.
+
+    Returns:
+        (n_sims, min(3, 頭数)) の int 配列. [s, r] = s 回目のシミュレーションで (r+1) 着になった馬の race の行番号
+    """
+    race = race.reset_index(drop=True)
+    p = np.clip(race["p_win"].to_numpy(dtype=float), PROB_FLOOR, None)
+    p = p / p.sum()
+    n = len(p)
+    k = min(TOP_N, n)
+    rng = np.random.default_rng(seed)
+    g1 = rng.gumbel(size=(n_sims, n))
+    g2 = rng.gumbel(size=(n_sims, n))
+    first = np.argmax(np.log(p) + g1, axis=1)
+    rows = np.arange(n_sims)
+
+    def rest(log_w: np.ndarray) -> np.ndarray:
+        s = log_w + g2
+        s[rows, first] = -np.inf
+        picks = []
+        for _ in range(k - 1):
+            pick = np.argmax(s, axis=1)
+            picks.append(pick)
+            s[rows, pick] = -np.inf
+        return np.column_stack(picks) if picks else np.empty((n_sims, 0), dtype=int)
+
+    log_w = np.log(p)
+    if p_top3 is not None and n > TOP_N:
+        target = _top3_target(p, np.asarray(p_top3, dtype=float))
+        p_first = np.bincount(first, minlength=n) / n_sims
+        want = np.clip(target - p_first, 1e-6, None)  # 2・3 着に入ってほしい割合
+        for _ in range(n_iter):
+            got = np.bincount(rest(log_w).ravel(), minlength=n) / n_sims
+            if np.abs(got - want).max() < tol:
+                break
+            log_w = log_w + np.log(want / np.clip(got, 1 / n_sims, None))
+            log_w = log_w - log_w.max()
+    return np.column_stack([first, rest(log_w)]).astype(int)
+
+
+def orders_to_in_top(orders: np.ndarray, n: int) -> np.ndarray:
+    """simulate_orders の結果を, (n_sims, 頭数) の「3 着以内か」の bool 配列にする."""
+    in_top = np.zeros((len(orders), n), dtype=bool)
+    np.put_along_axis(in_top, orders, True, axis=1)
+    return in_top
+
+
+def simulate_top3(
+    race: pd.DataFrame, n_sims: int = 20000, seed: int = 0, p_top3: np.ndarray | None = None
+) -> np.ndarray:
+    """1 レース分の予測から, レース結果を n_sims 回シミュレーションする (simulate_orders).
+
+    p_top3 (3 着以内のモデルの確率) を渡せば, 各馬の 3 着以内の割合がそれに合うようにする.
 
     Returns:
         (n_sims, 頭数) の bool 配列. [s, i] = s 回目のシミュレーションで race の i 行目の馬が 3 着以内か
     """
-    race = race.reset_index(drop=True)
-    p = np.clip(race["p_win"].to_numpy(dtype=float), PROB_FLOOR, None)
-    n = len(p)
-    k = min(TOP_N, n)
-    rng = np.random.default_rng(seed)
-    noisy = np.log(p) + rng.gumbel(size=(n_sims, n))
-    top = np.argpartition(-noisy, k - 1, axis=1)[:, :k]
-    in_top = np.zeros((n_sims, n), dtype=bool)
-    np.put_along_axis(in_top, top, True, axis=1)
-    return in_top
+    orders = simulate_orders(race, n_sims=n_sims, seed=seed, p_top3=p_top3)
+    return orders_to_in_top(orders, len(race))
 
 
 def wide_probabilities(
@@ -534,7 +686,11 @@ def calibration_table(pred: pd.DataFrame, prob_col: str = "p_win") -> pd.DataFra
 
 
 def calibration_bins(
-    pred: pd.DataFrame, prob_col: str = "p_win", n_bins: int = 10, method: str = "quantile"
+    pred: pd.DataFrame,
+    prob_col: str = "p_win",
+    n_bins: int = 10,
+    method: str = "quantile",
+    target_col: str = TARGET_COLUMN,
 ) -> pd.DataFrame:
     """スコア (1 着の確率) を n_bins 個の帯に分け, 帯ごとにスコアの平均と実際の 1 着率を比べる.
 
@@ -550,9 +706,9 @@ def calibration_bins(
     """
     if method not in ("quantile", "width"):
         raise ValueError(f"method は 'quantile' か 'width' にしてください: {method}")
-    pred = pred[pred[TARGET_COLUMN].notna() & pred[prob_col].notna()]
+    pred = pred[pred[target_col].notna() & pred[prob_col].notna()]
     score = pred[prob_col].clip(0, 1).to_numpy(dtype=float)
-    y = pred[TARGET_COLUMN].astype(float).to_numpy()
+    y = pred[target_col].astype(float).to_numpy()
     if method == "quantile":
         # 同じスコアの馬が帯の境目をまたいでも頭数が揃うよう, 順位 (同じ値は出てきた順) で分ける
         order = np.argsort(score, kind="stable")
@@ -597,17 +753,148 @@ def calibration_summary(bins: pd.DataFrame) -> dict:
     }
 
 
-def compare_calibration(pred: pd.DataFrame, n_bins: int = 10, method: str = "quantile") -> dict:
-    """モデルのスコアと, 単勝オッズから逆算した確率のそれぞれで, 帯ごとのスコアの平均と実際の 1 着率を比べる.
+def compare_calibration(pred: pd.DataFrame, n_bins: int = 10, method: str = "quantile", task: str = "win") -> dict:
+    """モデルのスコアと, 単勝オッズから計算した確率のそれぞれで, 帯ごとのスコアの平均と実際の割合を比べる.
 
+    task="win" : p_win と実際の 1 着率 (オッズ側は単勝オッズから逆算した確率)
+    task="top3": p_top3 (predict_top3 の出力) と実際の 3 着以内率 (オッズ側は Harville モデルで計算した 3 着以内の確率)
     既定は頭数が同じになるように 10 等分する (calibration_bins の method). 帯はそれぞれのスコアで別々に分ける.
     {"method": ..., "n_bins": ..., "model": calibration_summary(...), "odds": calibration_summary(...)}
     """
-    out = {"method": method, "n_bins": n_bins,
-           "model": calibration_summary(calibration_bins(pred, n_bins=n_bins, method=method))}
+    prob_col, target_col, baseline = (
+        ("p_top3", TOP3_COLUMN, odds_top3_baseline) if task == "top3" else ("p_win", TARGET_COLUMN, odds_baseline)
+    )
+    out = {"method": method, "n_bins": n_bins, "task": task,
+           "model": calibration_summary(calibration_bins(pred, prob_col, n_bins, method, target_col))}
     if "win_odds" in pred:
-        out["odds"] = calibration_summary(calibration_bins(odds_baseline(pred), n_bins=n_bins, method=method))
+        out["odds"] = calibration_summary(calibration_bins(baseline(pred), prob_col, n_bins, method, target_col))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 3 着以内のモデルの評価
+# ---------------------------------------------------------------------------
+def odds_top3_baseline(df: pd.DataFrame) -> pd.DataFrame:
+    """単勝オッズから Harville モデルで計算した 3 着以内の確率で予想した場合 (evaluate_top3 にそのまま渡せる)."""
+    out = df.drop(columns=["p_top3", "top3_rank", "top3_score"], errors="ignore").copy()
+    out["p_top3"] = market_top3_prob(out)
+    out["top3_rank"] = out.groupby("race_id")["p_top3"].rank(ascending=False, method="first").astype(int)
+    return out
+
+
+def evaluate_top3(pred: pd.DataFrame, prob_col: str = "p_top3", rank_col: str = "top3_rank") -> dict:
+    """3 着以内の確率の予測 (predict_top3 / odds_top3_baseline の出力, 結果確定済み) の評価指標.
+
+    roc_auc / roc_auc_by_race: 3 着以内か否かの ROC-AUC (全馬まとめて / レースごとの平均)
+    logloss        : 各馬の 3 着以内か否かの logloss (二値. 小さいほど良い)
+    brier          : Brier スコア (小さいほど良い)
+    place_hit      : 予測 1 位の馬が 3 着以内だった割合 (複勝の的中率)
+    top3_precision : 予測上位 3 頭のうち実際に 3 着以内だった割合 (レース平均)
+    sum_mean       : レースごとの確率の合計の平均 (3 に近いほど, レースの中で辻褄が合っている)
+    """
+    pred = pred[pred[TOP3_COLUMN].notna() & pred[prob_col].notna()]
+    y = pred[TOP3_COLUMN].astype(int)
+    p = pred[prob_col].clip(PROB_FLOOR, 1 - PROB_FLOOR)
+    rank, race = pred[rank_col], pred["race_id"]
+    return {
+        "n_races": int(race.nunique()),
+        "n_rows": int(len(pred)),
+        **roc_auc_summary(pred, prob_col, TOP3_COLUMN),
+        "logloss": float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean()),
+        "brier": float(brier_score_loss(y, p)),
+        "place_hit": float(y[rank == 1].mean()),
+        "top3_precision": float((y[rank <= TOP_N].groupby(race[rank <= TOP_N]).sum() / TOP_N).mean()),
+        "sum_mean": float(pred[prob_col].groupby(race).sum().mean()),
+    }
+
+
+def compare_top3_with_market(pred: pd.DataFrame, n_bootstrap: int = 2000, seed: int = 0) -> dict:
+    """3 着以内のモデルが, 単勝オッズから計算した 3 着以内の確率 (Harville モデル) より当たるか.
+
+    model_logloss / market_logloss: 各馬の二値の logloss (レースごとに合計し, レース数で割った値)
+    model_gain     : market_logloss - model_logloss (プラスならモデルの方が当たる)
+    model_gain_ci_low / model_gain_ci_high: model_gain の 95% 信頼区間 (レースを復元抽出するブートストラップ)
+    model_place_hit / market_place_hit: 予測 1 位の馬が 3 着以内だった割合 (オッズ側は Harville の 3 着以内の確率が最大の馬)
+    goal_met       : model_gain の 95% 信頼区間が 0 より上か
+    注意: Harville モデルは人気馬の 3 着以内の確率を高く見積もりがちなので, オッズ側にやや不利な比べ方になる.
+    """
+    d = pred[pred[TOP3_COLUMN].notna() & pred["p_top3"].notna()].copy()
+    odds = pd.to_numeric(d.get("win_odds"), errors="coerce").where(lambda o: o > 0)
+    d = d[odds.notna().groupby(d["race_id"]).transform("any")]
+    if d.empty:
+        return {"n_races": 0}
+    m = odds_top3_baseline(d)
+    y = d[TOP3_COLUMN].astype(int).to_numpy()
+
+    def race_loss(p):
+        p = np.clip(np.asarray(p, dtype=float), PROB_FLOOR, 1 - PROB_FLOOR)
+        return pd.Series(-(y * np.log(p) + (1 - y) * np.log(1 - p))).groupby(d["race_id"].to_numpy()).sum().to_numpy()
+
+    loss_model, loss_market = race_loss(d["p_top3"]), race_loss(m["p_top3"])
+    gain = loss_market - loss_model
+    idx = np.random.default_rng(seed).integers(0, len(gain), size=(n_bootstrap, len(gain)))
+    gains = gain[idx].mean(axis=1)
+    low = float(np.quantile(gains, 0.025))
+    return {
+        "n_races": int(len(gain)),
+        "model_logloss": float(loss_model.mean()),
+        "market_logloss": float(loss_market.mean()),
+        "model_gain": float(gain.mean()),
+        "model_gain_ci_low": low,
+        "model_gain_ci_high": float(np.quantile(gains, 0.975)),
+        "model_place_hit": float(y[(d["top3_rank"] == 1).to_numpy()].mean()),
+        "market_place_hit": float(y[(m["top3_rank"] == 1).to_numpy()].mean()),
+        "goal_met": bool(low > 0),
+    }
+
+
+def evaluate_joint_top3(
+    pred_win: pd.DataFrame, pred_top3: pd.DataFrame | None = None, n_sims: int = 2000, seed: int = 0
+) -> dict:
+    """着順のシミュレーション (simulate_orders) から出した確率の当たり具合 (1 着のモデル + 3 着以内のモデル の併用の確認).
+
+    pred_win: predict_win の出力 / pred_top3: predict_top3 の出力 (同じ馬. なければ 1 着のモデルだけで Harville)
+    top3_logloss : シミュレーションした 3 着以内の割合の, 各馬の二値の logloss (レースごとに合計した平均)
+    wide_hit     : シミュレーションでワイドの確率が最も高い組が的中した割合
+    trio_logloss : 実際の 3 着以内の 3 頭の組 (3 連複) に付けた確率の -log の平均
+    trifecta_logloss: 実際の 1〜3 着の順番 (3 連単) に付けた確率の -log の平均
+    (確率が 0 になった組は 1 / n_sims で数える)
+    """
+    keys = ["race_id", "umaban"]
+    d = pred_win.sort_values(keys).reset_index(drop=True)
+    if pred_top3 is not None:
+        d = d.merge(pred_top3[keys + ["p_top3"]].rename(columns={"p_top3": "_p_top3"}), on=keys, how="left")
+    d = d[d[TOP3_COLUMN].notna() & d["rank"].notna()]
+    top3_losses, wide_hits, trio, trifecta = [], [], [], []
+    for _, race in d.groupby("race_id", sort=False):
+        race = race.reset_index(drop=True)
+        if len(race) <= TOP_N:
+            continue
+        orders = simulate_orders(race, n_sims=n_sims, seed=seed,
+                                 p_top3=race["_p_top3"].to_numpy() if "_p_top3" in race else None)
+        in_top = orders_to_in_top(orders, len(race))
+        p3 = np.clip(in_top.mean(axis=0), 1 / n_sims, 1 - 1 / n_sims)
+        y = race[TOP3_COLUMN].astype(int).to_numpy()
+        top3_losses.append(float(-(y * np.log(p3) + (1 - y) * np.log(1 - p3)).sum()))
+        pair = in_top.T.astype(float) @ in_top.astype(float) / n_sims
+        np.fill_diagonal(pair, -1)
+        i, j = np.unravel_index(np.argmax(pair), pair.shape)
+        wide_hits.append(bool(y[i] and y[j]))
+        rank = pd.to_numeric(race["rank"], errors="coerce").to_numpy()
+        actual = [int(np.flatnonzero(rank == r)[0]) if (rank == r).sum() == 1 else -1 for r in (1, 2, 3)]
+        if -1 in actual:
+            continue  # 同着などで 1〜3 着が 1 頭ずつ決まらないレースは 3 連複・3 連単の評価から除く
+        hit_set = np.sort(orders, axis=1) == np.sort(actual)
+        trio.append(-np.log(max(hit_set.all(axis=1).mean(), 1 / n_sims)))
+        trifecta.append(-np.log(max((orders == np.array(actual)).all(axis=1).mean(), 1 / n_sims)))
+    return {
+        "n_races": len(top3_losses),
+        "top3_logloss": float(np.mean(top3_losses)) if top3_losses else float("nan"),
+        "wide_hit": float(np.mean(wide_hits)) if wide_hits else float("nan"),
+        "n_races_order": len(trio),
+        "trio_logloss": float(np.mean(trio)) if trio else float("nan"),
+        "trifecta_logloss": float(np.mean(trifecta)) if trifecta else float("nan"),
+    }
 
 
 def feature_importance(

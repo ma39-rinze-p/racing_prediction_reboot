@@ -49,7 +49,8 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_DIR = ROOT / "models" / "registry"
 REGISTRY_FILE = REGISTRY_DIR / "registry.json"
 PRODUCTION_DIR = ROOT / "models" / "production"
-MODEL_FILES = ["model.txt", "metadata.json", "feature_importance.csv"]
+# model_top3.txt / metadata_top3.json は 3 着以内のモデル (あれば推論で 1 着のモデルと併用する. 古いモデルにはない)
+MODEL_FILES = ["model.txt", "metadata.json", "feature_importance.csv", "model_top3.txt", "metadata_top3.json"]
 REQUIRED_FILES = ["model.txt", "metadata.json"]
 # 評価結果 (ノートブックの results/ の出力) のうち, バージョンごとに残すもの
 RESULT_FILES = ["summary.json", "roc_curve.png", "calibration.csv", "calibration_bins.png"]
@@ -104,6 +105,24 @@ def _summary(model_dir: Path) -> dict:
         "market_offset": bool(meta.get("market_offset", False)),
         # スコアを頭数が同じになるように 10 等分した帯ごとの, スコアの平均と実際の 1 着率 (predict_model.compare_calibration. 古いモデルにはない)
         "test_calibration": metrics.get("test_calibration", {}),
+        # 3 着以内のモデル (metadata_top3.json. なければ空)
+        "top3": _top3_summary(model_dir),
+    }
+
+
+def _top3_summary(model_dir: Path) -> dict:
+    path = Path(model_dir) / "metadata_top3.json"
+    if not path.exists():
+        return {}
+    metrics = json.loads(path.read_text(encoding="utf-8")).get("metrics", {})
+    keys = ("roc_auc", "roc_auc_by_race", "logloss", "place_hit", "top3_precision", "sum_mean")
+    test, odds = metrics.get("test", {}), metrics.get("test_odds_baseline", {})
+    return {
+        "test_metrics": {k: test.get(k) for k in keys if k in test},
+        "test_odds_baseline": {k: odds.get(k) for k in keys if k in odds},
+        "test_market": metrics.get("test_market", {}),
+        "test_calibration": metrics.get("test_calibration", {}),
+        "test_joint": metrics.get("test_joint", {}),
     }
 
 
@@ -278,6 +297,59 @@ def _calibration_lines(c: dict) -> list[str]:
     ]
 
 
+def _top3_lines(t: dict) -> list[str]:
+    """METRICS.md の「3 着以内のモデル」の節 (モデルがなければ空)."""
+    m, o = t.get("test_metrics") or {}, t.get("test_odds_baseline") or {}
+    if not m:
+        return []
+    rows = [
+        ("ROC-AUC (3 着以内か否か)", "roc_auc", 4),
+        ("ROC-AUC (レースごとの平均)", "roc_auc_by_race", 4),
+        ("logloss (各馬の二値. 小さいほど良い)", "logloss", 4),
+        ("予測 1 位の馬が 3 着以内だった割合 (複勝の的中率)", "place_hit", 3),
+        ("予測上位 3 頭のうち 3 着以内だった割合", "top3_precision", 3),
+        ("レースごとの確率の合計の平均 (3 に近いほど良い)", "sum_mean", 3),
+    ]
+    mk = t.get("test_market") or {}
+    lines = [
+        "## 3 着以内のモデル (テスト期間)",
+        "",
+        "各馬が 3 着以内に入る確率を予測するモデル. 推論では 1 着のモデルと併用して着順をシミュレーションする.",
+        "単勝オッズ = 単勝オッズから逆算した 1 着の確率で Harville モデルを使って計算した 3 着以内の確率.",
+        "",
+        "| 指標 | モデル | 単勝オッズ |",
+        "|---|---:|---:|",
+        *[f"| {label} | {_fmt(m.get(key), d)} | {_fmt(o.get(key), d)} |" for label, key, d in rows],
+        "",
+    ]
+    if mk.get("n_races"):
+        lines += [
+            f"オッズとの比較 (各馬の二値の logloss をレースごとに合計): 改善 {_fmt(mk.get('model_gain'), 4)} "
+            f"(95% 信頼区間 {_fmt(mk.get('model_gain_ci_low'), 4)} 〜 {_fmt(mk.get('model_gain_ci_high'), 4)}) → "
+            f"**{'オッズより当たる' if mk.get('goal_met') else 'オッズより当たるとは言えない'}**",
+            "",
+        ]
+    cal = (t.get("test_calibration") or {}).get("model") or {}
+    if cal:
+        lines += [f"スコアと実際の 3 着以内率のずれ (10 等分): ECE モデル {_fmt(cal.get('ece'), 4)} / "
+                  f"単勝オッズ {_fmt(((t.get('test_calibration') or {}).get('odds') or {}).get('ece'), 4)}", ""]
+    joint = t.get("test_joint") or {}
+    if joint.get("win_only") and joint.get("win_and_top3"):
+        a, b = joint["win_only"], joint["win_and_top3"]
+        lines += [
+            "着順のシミュレーションの当たり具合 (1 着のモデルだけ / 3 着以内のモデルも併用. logloss は小さいほど良い):",
+            "",
+            "| 指標 | 1 着のモデルだけ | 併用 |",
+            "|---|---:|---:|",
+            f"| 3 着以内の logloss (レースごとの合計) | {_fmt(a.get('top3_logloss'), 4)} | {_fmt(b.get('top3_logloss'), 4)} |",
+            f"| ワイドの確率が最も高い組の的中率 | {_pct(a.get('wide_hit'))} | {_pct(b.get('wide_hit'))} |",
+            f"| 3 連複の logloss | {_fmt(a.get('trio_logloss'), 4)} | {_fmt(b.get('trio_logloss'), 4)} |",
+            f"| 3 連単の logloss | {_fmt(a.get('trifecta_logloss'), 4)} | {_fmt(b.get('trifecta_logloss'), 4)} |",
+            "",
+        ]
+    return lines
+
+
 def _yen(value) -> str:
     return "-" if value is None else f"{value:+,.0f} 円"
 
@@ -335,6 +407,7 @@ def _write_metrics_file(version: str, info: dict) -> None:
         "",
         *_top_pick_lines(info.get("test_top_pick") or {}),
         *_calibration_lines(info.get("test_calibration") or {}),
+        *_top3_lines(info.get("top3") or {}),
         "## ROC 曲線 (テスト期間)",
         "",
         "![ROC 曲線](roc_curve.png)" if (PRODUCTION_DIR / "roc_curve.png").exists() else "(ROC 曲線の画像がありません)",

@@ -139,6 +139,11 @@ def print_summary() -> None:
         odds_ece = ((info.get("test_calibration") or {}).get("odds") or {}).get("ece")
         print(f"  スコアと実際の 1 着率のずれ (頭数が同じになるように 10 等分): ECE {cal['ece']:.4f}"
               + (f" (単勝オッズ {odds_ece:.4f})" if odds_ece is not None else ""))
+    t3 = (info.get("top3") or {}).get("test_metrics") or {}
+    if t3:
+        o3 = (info.get("top3") or {}).get("test_odds_baseline") or {}
+        print(f"  3 着以内のモデル: ROC-AUC={t3.get('roc_auc')} 複勝的中率={t3.get('place_hit')} "
+              f"(単勝オッズ: ROC-AUC={o3.get('roc_auc')} 複勝的中率={o3.get('place_hit')})")
     top = info.get("test_top_pick") or {}
     if top.get("n_races"):
         print(f"  1 着になった割合: 予測 1 位 {top['model_hit']:.1%} / 1 番人気 {top['favorite_hit']:.1%} "
